@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>XDownlder</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="titlebar">
+        <div class="brand">
+          <span class="mark"></span>
+          <em>XDownlder</em>
+          <small id="engine-tag">aria2</small>
+        </div>
+        <div id="speeds" class="speeds">↓ 0 B/s</div>
+        <div class="chrome-actions">
+          <button id="btn-theme" class="ghost" type="button">亮色</button>
+          <button id="btn-settings" class="ghost" type="button">设置</button>
+        </div>
+      </header>
+
+      <section class="intake" id="dropzone">
+        <textarea
+          id="url-input"
+          rows="2"
+          placeholder="粘贴 YouTube / 普通链接 / 磁力链，或拖入 .torrent .meta4。YouTube 会先解析再交给 aria2 多连接下载。"
+        ></textarea>
+        <div class="intake-row">
+          <label class="check">
+            <input id="multi-source" type="checkbox" checked />
+            同一文件多源
+          </label>
+          <label class="check">
+            <input id="add-paused" type="checkbox" />
+            先入队
+          </label>
+          <input id="out-name" class="mini" type="text" placeholder="另存为（可选）" />
+          <label class="check">
+            清晰度
+            <select id="yt-quality" class="mini">
+              <option value="best">最佳画质</option>
+              <option value="2160">2160p 4K</option>
+              <option value="1440">1440p 2K</option>
+              <option value="1080">1080p</option>
+              <option value="720">720p</option>
+              <option value="480">480p</option>
+              <option value="360">360p</option>
+              <option value="audio">仅音频</option>
+            </select>
+          </label>
+          <div class="spacer"></div>
+          <button id="btn-copy-urls" type="button">复制链接</button>
+          <button id="btn-clipboard" type="button">从剪贴板添加</button>
+          <button id="btn-torrent" type="button">种子</button>
+          <button id="btn-metalink" type="button">Metalink</button>
+          <button id="btn-add" class="primary" type="button">开始下载</button>
+        </div>
+        <details class="advanced" open>
+          <summary>任务选项</summary>
+          <div class="adv-grid">
+            <label>本机浏览器
+              <select id="opt-browser">
+                <option value="">检测中…</option>
+              </select>
+            </label>
+            <label>Referer<input id="opt-referer" type="text" placeholder="会按链接自动填" /></label>
+            <label>User-Agent<input id="opt-ua" type="text" placeholder="随所选浏览器自动填" /></label>
+            <label>校验 checksum<input id="opt-checksum" type="text" placeholder="sha-256=…" /></label>
+            <label>连接数<input id="opt-split" type="number" min="1" max="16" placeholder="16" /></label>
+            <label>分片策略
+              <select id="opt-piece">
+                <option value="">跟随全局</option>
+                <option value="default">default</option>
+                <option value="inorder">inorder 先下开头</option>
+                <option value="random">random</option>
+                <option value="geom">geom</option>
+              </select>
+            </label>
+            <label>Header<input id="opt-header" type="text" placeholder="Cookie: …" /></label>
+          </div>
+        </details>
+      </section>
+
+      <div id="clip-banner" class="banner" hidden></div>
+      <div id="toast" class="toast" hidden></div>
+
+      <nav class="filters" id="filters">
+        <button data-filter="all" class="on">全部</button>
+        <button data-filter="active">进行中</button>
+        <button data-filter="waiting">排队</button>
+        <button data-filter="done">已完成</button>
+      </nav>
+
+      <main id="list" class="list"></main>
+    </div>
+
+    <aside id="inspector" class="inspector" hidden></aside>
+    <aside id="settings" class="sheet" hidden>
+      <button id="btn-settings-close" class="ghost sheet-close" type="button">关闭</button>
+      <div id="settings-body"></div>
+    </aside>
+
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

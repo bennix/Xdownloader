@@ -1,0 +1,16 @@
+node_modules/
+out/
+dist/
+release/
+.cache/
+*.log
+.DS_Store
+.env
+.env.notarize
+.idea/
+.vscode/
+resources/bin/*
+!resources/bin/.gitkeep
+build/icon.iconset/
+build/icon-1024.png
+build/icon.svg.png

@@ -1,0 +1,68 @@
+{
+  "name": "xdownloader",
+  "version": "1.0.0",
+  "description": "Xdownloader — macOS 上的 aria2 桌面客户端，内置 yt-dlp 与 ffmpeg",
+  "main": "./out/main/index.js",
+  "type": "module",
+  "author": "ZHIPING XU",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bennix/Xdownloader.git"
+  },
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "prepare:bins": "bash scripts/prepare-bins.sh",
+    "icons": "bash scripts/make-icon.sh",
+    "dist": "npm run prepare:bins && npm run icons && electron-vite build && electron-builder --mac dmg"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "electron": "^38.1.2",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^4.0.1",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5"
+  },
+  "build": {
+    "appId": "com.zhipingxu.xdownloader",
+    "productName": "Xdownloader",
+    "copyright": "Copyright © ZHIPING XU",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "out/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/bin",
+        "to": "bin"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "icon": "build/icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "identity": "ZHIPING XU (5N66S29EK2)",
+      "notarize": true
+    },
+    "dmg": {
+      "artifactName": "Xdownloader-${version}-arm64.${ext}"
+    }
+  }
+}

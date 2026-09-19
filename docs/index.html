@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Xdownloader — 把 aria2 做成一只会听的下载器</title>
+    <meta name="description" content="Xdownloader 是面向 macOS 的 aria2 桌面客户端。多连接分块可视化、YouTube 音画合成、开发者公证的 DMG，ffmpeg / yt-dlp / aria2 已打进应用。" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,520;9..144,680&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <style>
+      :root {
+        --paper: #14110e;
+        --ink: #f4eee4;
+        --quiet: #9a9184;
+        --line: #3a342c;
+        --signal: #e8a54b;
+        --ready: #6fbf8a;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; background: var(--paper); color: var(--ink); }
+      body {
+        font-family: "IBM Plex Sans", sans-serif;
+        min-height: 100vh;
+        background-image:
+          radial-gradient(1200px 600px at 80% -10%, rgba(232, 165, 75, 0.08), transparent 50%),
+          linear-gradient(180deg, #1a1814 0%, #14110e 40%, #100e0b 100%);
+      }
+      a { color: inherit; }
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 28px 7vw;
+        border-bottom: 1px solid var(--line);
+      }
+      .brand { display: flex; gap: 12px; align-items: center; letter-spacing: 0.08em; font-size: 13px; }
+      .mark {
+        width: 28px; height: 28px; border: 1px solid var(--signal); border-radius: 8px;
+        display: grid; place-items: center; color: var(--signal); font-family: "IBM Plex Mono", monospace;
+      }
+      nav { display: flex; gap: 28px; color: var(--quiet); font-size: 13px; }
+      nav a { text-decoration: none; }
+      nav a:hover { color: var(--ink); }
+      .hero { padding: 10vh 7vw 8vh; display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 64px; align-items: end; }
+      .kicker { font-family: "IBM Plex Mono", monospace; color: var(--signal); font-size: 12px; letter-spacing: 0.18em; text-transform: uppercase; }
+      h1 {
+        font-family: Fraunces, serif;
+        font-size: clamp(48px, 7vw, 92px);
+        line-height: 0.92;
+        font-weight: 680;
+        margin: 18px 0 24px;
+        max-width: 12ch;
+      }
+      .lead { max-width: 42ch; color: var(--quiet); font-size: 18px; line-height: 1.6; }
+      .cta { display: flex; gap: 14px; margin-top: 36px; flex-wrap: wrap; }
+      .btn {
+        display: inline-flex; align-items: center; gap: 10px;
+        padding: 14px 22px; border-radius: 999px; text-decoration: none; font-size: 15px;
+        border: 1px solid var(--line);
+      }
+      .btn.primary { background: var(--signal); color: #1a140a; border-color: var(--signal); }
+      .btn.ghost:hover { border-color: var(--signal); }
+      .meta { font-family: "IBM Plex Mono", monospace; font-size: 12px; color: var(--quiet); margin-top: 18px; }
+      .slab {
+        border: 1px solid var(--line); padding: 28px;
+        background: rgba(255,255,255,0.02);
+      }
+      .slab b { display: block; font-family: Fraunces, serif; font-size: 40px; margin-bottom: 8px; }
+      .slab span { color: var(--quiet); font-size: 14px; }
+      section { padding: 8vh 7vw; border-top: 1px solid var(--line); }
+      h2 { font-family: Fraunces, serif; font-size: 36px; font-weight: 520; margin: 0 0 28px; }
+      .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; }
+      article { border-top: 1px solid var(--signal); padding-top: 18px; }
+      article h3 { margin: 0 0 10px; font-size: 18px; }
+      article p { margin: 0; color: var(--quiet); line-height: 1.55; }
+      .strip { display: flex; justify-content: space-between; gap: 24px; color: var(--quiet); font-family: "IBM Plex Mono", monospace; font-size: 12px; }
+      footer { padding: 36px 7vw 48px; color: var(--quiet); display: flex; justify-content: space-between; font-size: 13px; }
+      @media (max-width: 860px) {
+        .hero, .grid, header, footer, .strip { display: block; }
+        nav { margin-top: 16px; }
+        .slab { margin-top: 36px; }
+        article { margin-bottom: 22px; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand"><span class="mark">X</span> XDOWNLOADER</div>
+      <nav>
+        <a href="#features">能力</a>
+        <a href="#bundle">内置引擎</a>
+        <a href="https://github.com/bennix/Xdownloader">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero" style="border: 0; padding-top: 12vh;">
+        <div>
+          <div class="kicker">macOS · Developer ID 公证</div>
+          <h1>把整条下载管线握在一只手里。</h1>
+          <p class="lead">aria2 负责多连接分段，yt-dlp 负责 YouTube，ffmpeg 负责把无声画面和音轨对齐合成。这三样已经打进应用，打开就能用。</p>
+          <div class="cta">
+            <a class="btn primary" href="https://github.com/bennix/Xdownloader/releases/latest">下载公证 DMG</a>
+            <a class="btn ghost" href="https://github.com/bennix/Xdownloader">查看源码</a>
+          </div>
+          <p class="meta">Apple Silicon · 已公证 · 不经过 Homebrew 也能跑</p>
+        </div>
+        <div class="slab">
+          <b>16</b>
+          <span>默认每条任务 16 路连接，进度条按分块逐步点亮，不再是一根糊掉的百分比。</span>
+        </div>
+      </section>
+
+      <section id="features">
+        <h2>下载器该有的，都还在。</h2>
+        <div class="grid">
+          <article>
+            <h3>HTTP / FTP / BT / Metalink</h3>
+            <p>会话续传、多源镜像、磁力与种子。队列里的任务可以提前，下完的会留在「全部」和「已完成」。</p>
+          </article>
+          <article>
+            <h3>YouTube 清晰度</h3>
+            <p>从已登录的本机浏览器读取 Cookies。同清晰度优先一路到位；必须分轨时再合成，并校准起始时间戳。</p>
+          </article>
+          <article>
+            <h3>暗色 / 亮色</h3>
+            <p>窗口和原生控件跟着主题走。链接支持粘贴、剪贴板和拖放，目录一键在访达里显示。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="bundle">
+        <h2>随应用走的引擎。</h2>
+        <div class="strip">
+          <div>aria2c 内置</div>
+          <div>yt-dlp 独立二进制</div>
+          <div>ffmpeg + ffprobe</div>
+          <div>Apple 公证</div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div>© Xdownloader · ZHIPING XU</div>
+      <div>zpxu@fudan.edu.cn</div>
+    </footer>
+  </body>
+</html>

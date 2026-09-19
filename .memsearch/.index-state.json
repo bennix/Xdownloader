@@ -1,0 +1,16 @@
+{
+  "collection": "ms_downloader_408d8e7a",
+  "failed_files": [],
+  "last_completed_at": "2026-09-19T11:57:23.708019Z",
+  "last_error": "RuntimeError: Could not open the local Milvus database at /Users/nellertcai/.memsearch/milvus.db: <ConnectionConfigException: (code=1, message=Open local milvus failed)>. Milvus Lite 3.x stores a database as a directory, but this path is a file. If it is a database from Milvus Lite 2.x, move it aside and rebuild the index with 'memsearch index'. Otherwise check the configured URI, or use Milvus Server via Docker or Zilliz Cloud.",
+  "last_failed_at": "2026-09-19T11:57:23.708019Z",
+  "last_started_at": "2026-09-19T11:57:13.998704Z",
+  "milvus_uri": "~/.memsearch/milvus.db",
+  "operation": "index",
+  "paths": [
+    "/Users/nellertcai/Downloader/.memsearch/memory"
+  ],
+  "schema_version": 1,
+  "status": "error",
+  "updated_at": "2026-09-19T11:57:23.708019Z"
+}
