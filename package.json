@@ -1,6 +1,6 @@
 {
   "name": "xdownloader",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Xdownloader — macOS 上的 aria2 桌面客户端，内置 yt-dlp 与 ffmpeg",
   "main": "./out/main/index.js",
   "type": "module",

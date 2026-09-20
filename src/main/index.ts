@@ -239,7 +239,7 @@ function startPolling(): void {
 
 function watchClipboard(): void {
   if (!win || win.isDestroyed() || !win.isFocused()) return
-  const urls = readClipboardUrls().filter((url) => !ownedClipboard.has(url))
+  const urls = readClipboardUrls().filter((url) => !ownedClipboard.has(url) && !engine.isFinishedUrl(url))
   const key = urls.join('\n')
   if (!urls.length || key === lastClipboardKey) return
   lastClipboardKey = key

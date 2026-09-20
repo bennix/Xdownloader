@@ -137,7 +137,9 @@ export class AriaEngine {
     await mkdir(this.userData, { recursive: true })
     this.settings = await this.loadSettings()
     await this.loadHistory()
+    await this.loadYoutubePages()
     await this.recoverHistoryFromDisk()
+    await this.pruneSessionFile()
     const binary = resolveBinary(this.settings.aria2Path)
     if (!binary) {
       this.error = '未找到 aria2c。打开设置后会自动用 Homebrew 安装。'
@@ -237,6 +239,7 @@ export class AriaEngine {
     for (const task of tasks) {
       if (task.status === 'complete') this.rememberTask(task)
     }
+    void this.archiveFinished(tasks)
     const extras = this.history
       .filter((item) => !tasks.some((task) => task.gid === item.gid || (item.path && task.path === item.path)))
       .map((item) => this.historyToTask(item))
@@ -276,7 +279,7 @@ export class AriaEngine {
     if (!uris.length) return { ok: false, added: 0, error: '没有可用的下载链接' }
 
     const youtube = uris.filter(isYouTubeUrl)
-    const rest = uris.filter((uri) => !isYouTubeUrl(uri))
+    const rest = uris.filter((uri) => !isYouTubeUrl(uri) && !this.isFinishedUrl(uri))
     let added = 0
     try {
       if (youtube.length) {
@@ -285,7 +288,11 @@ export class AriaEngine {
         added += yt.added
         if (!yt.ok) this.error = yt.error ?? this.error
       }
-      if (!rest.length) return { ok: added > 0, added, error: added ? undefined : '没有可用的下载链接' }
+      if (!rest.length) {
+        if (added) return { ok: true, added }
+        const already = uris.some((uri) => this.isFinishedUrl(uri) || (isYouTubeUrl(uri) && this.alreadyHaveYouTube(uri)))
+        return { ok: false, added: 0, error: already ? '已经下载完成，不会重复添加' : '没有可用的下载链接' }
+      }
 
       const options = this.taskOptions(payload)
       if (payload.multiSource) {
@@ -296,13 +303,14 @@ export class AriaEngine {
           added += 1
         }
         for (const magnet of magnets) {
-          await this.rpc.call('aria2.addUri', [[magnet], options])
+          await this.rpc.call('aria2.addUri', [[magnet], { ...options, 'force-save': 'true' }])
           added += 1
         }
         return { ok: true, added }
       }
       for (const uri of rest) {
-        await this.rpc.call('aria2.addUri', [[uri], options])
+        const extra = classifyUrl(uri) === 'magnet' ? { ...options, 'force-save': 'true' } : options
+        await this.rpc.call('aria2.addUri', [[uri], extra])
         added += 1
       }
       return { ok: true, added }
@@ -314,7 +322,7 @@ export class AriaEngine {
   async addTorrent(base64: string, webSeeds: string[] = []): Promise<{ ok: boolean; error?: string }> {
     if (!this.rpc) return { ok: false, error: '引擎未就绪' }
     try {
-      await this.rpc.call('aria2.addTorrent', [base64, webSeeds, { dir: this.settings.downloadDir }])
+      await this.rpc.call('aria2.addTorrent', [base64, webSeeds, { dir: this.settings.downloadDir, 'force-save': 'true' }])
       return { ok: true }
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) }
@@ -324,7 +332,7 @@ export class AriaEngine {
   async addMetalink(base64: string): Promise<{ ok: boolean; added: number; error?: string }> {
     if (!this.rpc) return { ok: false, added: 0, error: '引擎未就绪' }
     try {
-      const gids = await this.rpc.call<string[]>('aria2.addMetalink', [base64, { dir: this.settings.downloadDir }])
+      const gids = await this.rpc.call<string[]>('aria2.addMetalink', [base64, { dir: this.settings.downloadDir, 'force-save': 'true' }])
       return { ok: true, added: gids.length }
     } catch (error) {
       return { ok: false, added: 0, error: error instanceof Error ? error.message : String(error) }
@@ -352,6 +360,7 @@ export class AriaEngine {
     await this.rpc.call('aria2.removeDownloadResult', [gid]).catch(() => undefined)
     this.youtubeGids.delete(gid)
     this.youtubePages.delete(gid)
+    void this.saveYoutubePages()
     this.forgetHistory(gid, files)
     if (job && (job.videoGid === gid || job.audioGid === gid)) {
       const other = job.videoGid === gid ? job.audioGid : job.videoGid
@@ -420,16 +429,17 @@ export class AriaEngine {
       const video = await this.pathOf(job.videoGid)
       const audio = await this.pathOf(job.audioGid)
       if (!video.path || !audio.path) throw new Error('音画文件还没就绪')
-      await mergeMedia(video.path, audio.path, job.outputPath)
+      const dest = await mergeMedia(video.path, audio.path, job.outputPath)
       const pageUrl = this.youtubePages.get(job.videoGid) || this.youtubePages.get(job.audioGid) || ''
       await this.remove(job.videoGid, false).catch(() => undefined)
       await this.remove(job.audioGid, false).catch(() => undefined)
-      this.rememberMerged(job.outputPath, pageUrl, 'youtube')
+      this.rememberMerged(dest, pageUrl, 'youtube')
+      await this.rpc.call('aria2.saveSession').catch(() => undefined)
       const index = this.mergeJobs.indexOf(job)
       if (index >= 0) this.mergeJobs.splice(index, 1)
       await this.saveMergeJobs()
       this.mergeFailAt.delete(job.outputPath)
-      this.onEvent?.('aria.onYoutubeMerged', job.outputPath)
+      this.onEvent?.('aria.onYoutubeMerged', dest)
     } catch (error) {
       job.merging = false
       const message = error instanceof Error ? error.message : String(error)
@@ -726,7 +736,7 @@ export class AriaEngine {
       `--timeout=60`,
       `--save-session=${this.sessionFile}`,
       `--save-session-interval=20`,
-      `--force-save=true`,
+      `--force-save=false`,
       ...(existsSync(this.sessionFile) ? [`--input-file=${this.sessionFile}`] : []),
       `--keep-unfinished-download-result=true`,
       `--max-download-result=1000`,
@@ -750,7 +760,6 @@ export class AriaEngine {
       `--user-agent=${s.userAgent}`
     ]
     if (s.allProxy) args.push(`--all-proxy=${s.allProxy}`)
-    if (existsSync(this.sessionFile)) args.push(`--input-file=${this.sessionFile}`)
     return args
   }
 
@@ -773,6 +782,69 @@ export class AriaEngine {
     } catch {
       /* first run */
     }
+  }
+
+  private get youtubePagesFile(): string {
+    return join(this.userData, 'youtube-pages.json')
+  }
+
+  private async saveYoutubePages(): Promise<void> {
+    await writeFile(this.youtubePagesFile, JSON.stringify([...this.youtubePages.entries()]), 'utf8').catch(() => undefined)
+  }
+
+  private async loadYoutubePages(): Promise<void> {
+    try {
+      const raw = JSON.parse(await readFile(this.youtubePagesFile, 'utf8')) as [string, string][]
+      this.youtubePages.clear()
+      this.youtubeGids.clear()
+      for (const [gid, page] of raw) {
+        if (!gid || !page) continue
+        this.youtubePages.set(gid, page)
+        this.youtubeGids.add(gid)
+      }
+    } catch {
+      /* first run */
+    }
+  }
+
+  isFinishedUrl(url: string): boolean {
+    return this.alreadyHaveYouTube(url) || this.history.some((item) => item.urls.includes(url) && existsSync(item.path))
+  }
+
+  private alreadyHaveYouTube(url: string): boolean {
+    if (this.hasYoutubePage(url)) return true
+    const id = youtubeVideoId(url)
+    return this.history.some((item) => {
+      if (!item.pageUrl) return false
+      const same = id ? youtubeVideoId(item.pageUrl) === id : item.pageUrl === url
+      return same && (!item.path || existsSync(item.path))
+    })
+  }
+
+  private pendingMerge(gid: string): boolean {
+    return this.mergeJobs.some((job) => job.videoGid === gid || job.audioGid === gid)
+  }
+
+  private async archiveFinished(tasks: Task[]): Promise<void> {
+    if (!this.rpc) return
+    for (const task of tasks) {
+      if (task.status !== 'complete' || task.infoHash || this.pendingMerge(task.gid)) continue
+      await this.rpc.call('aria2.removeDownloadResult', [task.gid]).catch(() => undefined)
+    }
+  }
+
+  private async pruneSessionFile(): Promise<void> {
+    if (!existsSync(this.sessionFile)) return
+    const raw = await readFile(this.sessionFile, 'utf8').catch(() => '')
+    if (!raw.trim()) return
+    const kept: string[] = []
+    for (const block of raw.split(/\n{2,}/)) {
+      const text = block.trim()
+      if (!text) continue
+      if (keepSessionEntry(text, this.settings.downloadDir)) kept.push(text)
+    }
+    const next = kept.length ? `${kept.join('\n\n')}\n` : ''
+    await writeFile(this.sessionFile, next, 'utf8')
   }
 
   private async loadHistory(): Promise<void> {
@@ -927,13 +999,10 @@ export class AriaEngine {
         if (!video || !audio) continue
         if (this.mergeJobs.some((job) => job.videoGid === video.gid && job.audioGid === audio.gid)) continue
         const base = video.name.replace(/\.video(\.\d+)?\.[^.]+$/, '')
-        const vExt = video.path.split('.').pop() || 'mp4'
-        const aExt = audio.path.split('.').pop() || 'm4a'
-        const ext = vExt === 'mp4' && /m4a|mp4|aac/.test(aExt) ? 'mp4' : 'mkv'
         this.mergeJobs.push({
           videoGid: video.gid,
           audioGid: audio.gid,
-          outputPath: join(video.dir || this.settings.downloadDir, `${base}.${ext}`),
+          outputPath: join(video.dir || this.settings.downloadDir, `${base}.mp4`),
           videoDone: true,
           audioDone: true,
           merging: false
@@ -945,10 +1014,10 @@ export class AriaEngine {
         if (!this.canRetryMerge(pair.outputPath)) continue
         this.onEvent?.('aria.onYoutubeMerge', pair.outputPath)
         try {
-          await mergeMedia(pair.videoPath, pair.audioPath, pair.outputPath)
+          const dest = await mergeMedia(pair.videoPath, pair.audioPath, pair.outputPath)
           this.mergeFailAt.delete(pair.outputPath)
-          this.rememberMerged(pair.outputPath, '', 'youtube')
-          this.onEvent?.('aria.onYoutubeMerged', pair.outputPath)
+          this.rememberMerged(dest, '', 'youtube')
+          this.onEvent?.('aria.onYoutubeMerged', dest)
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
           this.error = message
@@ -1001,8 +1070,8 @@ export class AriaEngine {
     let added = 0
     let lastError = ''
     for (const url of unique(urls)) {
-      if (this.addingPages.has(url) || this.hasYoutubePage(url)) {
-        lastError = lastError || '该视频已在任务里'
+      if (this.addingPages.has(url) || this.alreadyHaveYouTube(url)) {
+        lastError = lastError || '该视频已在任务里或已经下载完成'
         continue
       }
       this.addingPages.add(url)
@@ -1045,11 +1114,10 @@ export class AriaEngine {
     if (video.video && video.audio) {
       const videoGid = await this.addYtStream(video.video, video.pageUrl, `${base}.video.${video.video.ext}`, payload)
       const audioGid = await this.addYtStream(video.audio, video.pageUrl, `${base}.audio.${video.audio.ext}`, payload)
-      const ext = video.video.ext === 'mp4' && /m4a|mp4/.test(video.audio.ext) ? 'mp4' : 'mkv'
       this.mergeJobs.push({
         videoGid,
         audioGid,
-        outputPath: join(this.settings.downloadDir, `${base}.${ext}`),
+        outputPath: join(this.settings.downloadDir, `${base}.mp4`),
         videoDone: false,
         audioDone: false,
         merging: false
@@ -1081,6 +1149,7 @@ export class AriaEngine {
     const gid = await this.rpc.call<string>('aria2.addUri', [[stream.url], options])
     this.youtubeGids.add(gid)
     this.youtubePages.set(gid, pageUrl)
+    void this.saveYoutubePages()
     return gid
   }
 
@@ -1140,6 +1209,37 @@ type MergeJob = {
   videoDone: boolean
   audioDone: boolean
   merging: boolean
+}
+
+function keepSessionEntry(block: string, downloadDir: string): boolean {
+  const lines = block.split('\n')
+  const uris: string[] = []
+  const options: Record<string, string> = {}
+  for (const line of lines) {
+    if (/^[ \t]/.test(line)) {
+      const trimmed = line.trim()
+      const eq = trimmed.indexOf('=')
+      if (eq > 0) options[trimmed.slice(0, eq)] = trimmed.slice(eq + 1)
+    } else if (line.trim()) {
+      uris.push(line.trim())
+    }
+  }
+  const uri = uris[0] || ''
+  if (/^magnet:/i.test(uri) || /\.torrent($|\?)/i.test(uri) || options.infoHash) return true
+  const dir = options.dir || downloadDir
+  const out = options.out || decodeURIComponent((uri.split('/').pop() || '').split('?')[0])
+  const path = out ? join(dir, out) : ''
+  if (path && existsSync(`${path}.aria2`)) return true
+  if (path && existsSync(path)) return false
+  if (path) {
+    const merged = guessMergedOutput(path)
+    if (merged) return false
+  }
+  if (/googlevideo\.com/i.test(uri) && path && /\.(video|audio)(\.\d+)?\.[^.]+$/.test(path)) {
+    const stem = path.replace(/\.(video|audio)(\.\d+)?\.[^.]+$/, '')
+    if (['.mp4', '.mkv', '.webm', '.m4a'].some((ext) => existsSync(`${stem}${ext}`))) return false
+  }
+  return true
 }
 
 function resolveBinary(custom: string): string | null {

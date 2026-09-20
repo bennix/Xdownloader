@@ -229,45 +229,67 @@ export type UnmergedPair = {
   outputPath: string
 }
 
-export async function mergeMedia(videoPath: string, audioPath: string, outputPath: string): Promise<void> {
+export async function mergeMedia(videoPath: string, audioPath: string, outputPath: string): Promise<string> {
   const ffmpeg = findFfmpeg()
   if (!ffmpeg) throw new Error('未找到 ffmpeg，无法合成 YouTube 音画')
   await waitFile(videoPath)
   await waitFile(audioPath)
-  const videoClock = await probeClock(ffmpeg, videoPath).catch(() => ({ start: 0, duration: 0 }))
-  const audioClock = await probeClock(ffmpeg, audioPath).catch(() => ({ start: 0, duration: 0 }))
-  const inputs = alignedInputs(videoPath, audioPath, videoClock.start, audioClock.start)
-  const mux = ['-map', '0:v:0', '-map', '1:a:0', '-avoid_negative_ts', 'make_zero', '-max_interleave_delta', '0', '-movflags', '+faststart', '-shortest']
+  const dest = outputPath.replace(/\.[^.]+$/, '.mp4')
+  const videoInfo = await probeMedia(ffmpeg, videoPath).catch(() => emptyMedia())
+  const audioInfo = await probeMedia(ffmpeg, audioPath).catch(() => emptyMedia())
+  const common = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-i', videoPath, '-i', audioPath]
+  const mux = ['-avoid_negative_ts', 'make_zero', '-max_interleave_delta', '0', '-movflags', '+faststart', '-shortest']
+  const copyOk = isMp4Video(videoInfo.vcodec) && isAac(audioInfo.acodec)
   try {
-    await run(ffmpeg, [...inputs, ...mux, '-c', 'copy', outputPath], 300000)
-    if (await outputLooksCut(ffmpeg, outputPath, videoClock.duration, audioClock.duration)) {
+    if (copyOk) {
+      await run(ffmpeg, [...common, '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy', ...mux, dest], 300000)
+    } else {
+      throw new Error('需要重编码才能对齐时间轴')
+    }
+    if (await outputLooksCut(ffmpeg, dest, videoInfo.duration, audioInfo.duration)) {
       throw new Error('copy 合成时长异常')
     }
-  } catch (copyError) {
+  } catch {
     try {
-      const args = [
-        ...inputs,
-        ...mux,
-        '-c:v',
-        'copy',
-        '-c:a',
-        'aac',
-        '-b:a',
-        '192k',
-        '-af',
-        'aresample=async=1:first_pts=0'
-      ]
-      await run(ffmpeg, [...args, outputPath], 300000)
+      await run(
+        ffmpeg,
+        [
+          ...common,
+          '-filter_complex',
+          '[0:v]setpts=PTS-STARTPTS[v];[1:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a]',
+          '-map',
+          '[v]',
+          '-map',
+          '[a]',
+          '-c:v',
+          'libx264',
+          '-preset',
+          'veryfast',
+          '-crf',
+          '20',
+          '-pix_fmt',
+          'yuv420p',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '192k',
+          '-ac',
+          '2',
+          ...mux,
+          dest
+        ],
+        900000
+      )
     } catch (encodeError) {
-      const copyMsg = copyError instanceof Error ? copyError.message : String(copyError)
       const encodeMsg = encodeError instanceof Error ? encodeError.message : String(encodeError)
-      throw new Error(encodeMsg || copyMsg || 'ffmpeg 合成失败')
+      throw new Error(encodeMsg || 'ffmpeg 合成失败')
     }
   }
   await unlink(videoPath).catch(() => undefined)
   await unlink(audioPath).catch(() => undefined)
   await unlink(`${videoPath}.aria2`).catch(() => undefined)
   await unlink(`${audioPath}.aria2`).catch(() => undefined)
+  return dest
 }
 
 export async function findUnmergedPairs(dir: string): Promise<UnmergedPair[]> {
@@ -280,10 +302,7 @@ export async function findUnmergedPairs(dir: string): Promise<UnmergedPair[]> {
     const stem = video.replace(/\.video(\.\d+)?\.[^.]+$/, '')
     const audio = audios.find((name) => name.replace(/\.audio(\.\d+)?\.[^.]+$/, '') === stem)
     if (!audio) continue
-    const vExt = video.split('.').pop() || 'mp4'
-    const aExt = audio.split('.').pop() || 'm4a'
-    const ext = vExt === 'mp4' && /m4a|mp4|aac/.test(aExt) ? 'mp4' : 'mkv'
-    const outputPath = join(dir, `${stem || 'youtube'}.${ext}`)
+    const outputPath = join(dir, `${stem || 'youtube'}.mp4`)
     const videoPath = join(dir, video)
     const audioPath = join(dir, audio)
     if (existsSync(outputPath) && statSync(outputPath).size > 1024) {
@@ -331,50 +350,52 @@ function waitFile(path: string, timeoutMs = 20000): Promise<void> {
   })
 }
 
-type MediaClock = { start: number; duration: number }
+type MediaInfo = { start: number; duration: number; vcodec: string; acodec: string }
 
-function alignedInputs(videoPath: string, audioPath: string, videoStart: number, audioStart: number): string[] {
-  const args = ['-hide_banner', '-y', '-fflags', '+genpts']
-  const delay = videoStart - audioStart
-  if (delay >= 0.02) {
-    args.push('-i', videoPath, '-itsoffset', delay.toFixed(3), '-i', audioPath)
-  } else if (delay <= -0.02) {
-    args.push('-itsoffset', (-delay).toFixed(3), '-i', videoPath, '-i', audioPath)
-  } else {
-    args.push('-i', videoPath, '-i', audioPath)
-  }
-  return args
+function emptyMedia(): MediaInfo {
+  return { start: 0, duration: 0, vcodec: '', acodec: '' }
 }
 
-async function probeClock(ffmpeg: string, file: string): Promise<MediaClock> {
+function isMp4Video(codec: string): boolean {
+  return /^(h264|avc|hevc|h265)$/i.test(codec)
+}
+
+function isAac(codec: string): boolean {
+  return /^(aac|mp4a)$/i.test(codec)
+}
+
+async function probeMedia(ffmpeg: string, file: string): Promise<MediaInfo> {
   const probe = ffmpeg.replace(/ffmpeg$/, 'ffprobe')
   const binary =
     (existsSync(probe) ? probe : null) ||
     bundledTool('ffprobe') ||
     firstExisting(['/opt/homebrew/bin/ffprobe', '/usr/local/bin/ffprobe', '/usr/bin/ffprobe'])
-  if (!binary) return { start: 0, duration: 0 }
+  if (!binary) return emptyMedia()
   const raw = await run(
     binary,
-    ['-v', 'error', '-show_entries', 'stream=start_time,duration:format=duration', '-of', 'json', file],
+    ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,start_time,duration:format=duration', '-of', 'json', file],
     15000
   )
   const data = JSON.parse(raw) as {
-    streams?: { start_time?: string; duration?: string }[]
+    streams?: { codec_type?: string; codec_name?: string; start_time?: string; duration?: string }[]
     format?: { duration?: string }
   }
-  const stream = data.streams?.[0]
-  const start = Number(stream?.start_time ?? 0)
-  const duration = Number(stream?.duration || data.format?.duration || 0)
+  const video = data.streams?.find((item) => item.codec_type === 'video')
+  const audio = data.streams?.find((item) => item.codec_type === 'audio')
+  const start = Number(video?.start_time ?? audio?.start_time ?? 0)
+  const duration = Number(video?.duration || audio?.duration || data.format?.duration || 0)
   return {
     start: Number.isFinite(start) ? start : 0,
-    duration: Number.isFinite(duration) ? duration : 0
+    duration: Number.isFinite(duration) ? duration : 0,
+    vcodec: video?.codec_name || '',
+    acodec: audio?.codec_name || ''
   }
 }
 
 async function outputLooksCut(ffmpeg: string, file: string, videoDuration: number, audioDuration: number): Promise<boolean> {
   const expect = Math.min(videoDuration || Infinity, audioDuration || Infinity)
   if (!Number.isFinite(expect) || expect <= 0) return false
-  const out = await probeClock(ffmpeg, file).catch(() => ({ start: 0, duration: 0 }))
+  const out = await probeMedia(ffmpeg, file).catch(() => emptyMedia())
   return out.duration <= 0 || out.duration + 1.2 < expect
 }
 
@@ -406,7 +427,7 @@ function pickStreams(info: YtInfo, quality: YtQuality, fallbackUrl: string): Res
     }
   }
 
-  if (progressive && (progressive.height ?? 0) >= (video?.height ?? 0)) {
+  if (progressive && (progressive.height ?? 0) >= (video?.height ?? 0) && !(video && videoRank(video) > videoRank(progressive))) {
     return {
       title: info.title || info.id || 'YouTube',
       pageUrl: info.webpage_url || fallbackUrl,
@@ -466,12 +487,29 @@ function bestAtOrBelow(formats: YtFormat[], cap: number): YtFormat | undefined {
   return formats.filter((item) => (item.height ?? 0) <= cap).sort(byVideo)[0]
 }
 
+function videoRank(format: YtFormat): number {
+  const codec = (format.vcodec || '').toLowerCase()
+  const ext = (format.ext || '').toLowerCase()
+  if (codec.startsWith('avc') || codec.includes('h264')) return 4
+  if (ext === 'mp4' && !codec.startsWith('vp') && !codec.startsWith('av01')) return 3
+  if (ext === 'mp4') return 2
+  return 1
+}
+
+function audioRank(format: YtFormat): number {
+  const codec = (format.acodec || '').toLowerCase()
+  const ext = (format.ext || '').toLowerCase()
+  if (codec.startsWith('mp4a') || codec.includes('aac')) return 3
+  if (ext === 'm4a' || ext === 'mp4') return 2
+  return 1
+}
+
 function byVideo(a: YtFormat, b: YtFormat): number {
-  return (b.height ?? 0) - (a.height ?? 0) || (b.tbr ?? 0) - (a.tbr ?? 0) || (b.fps ?? 0) - (a.fps ?? 0)
+  return (b.height ?? 0) - (a.height ?? 0) || videoRank(b) - videoRank(a) || (b.fps ?? 0) - (a.fps ?? 0) || (b.tbr ?? 0) - (a.tbr ?? 0)
 }
 
 function byAudio(a: YtFormat, b: YtFormat): number {
-  return (b.abr ?? 0) - (a.abr ?? 0) || (b.tbr ?? 0) - (a.tbr ?? 0)
+  return audioRank(b) - audioRank(a) || (b.abr ?? 0) - (a.abr ?? 0) || (b.tbr ?? 0) - (a.tbr ?? 0)
 }
 
 function flattenInfo(info: YtInfo): YtInfo[] {
