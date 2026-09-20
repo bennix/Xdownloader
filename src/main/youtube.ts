@@ -237,7 +237,7 @@ export async function mergeMedia(videoPath: string, audioPath: string, outputPat
   const videoClock = await probeClock(ffmpeg, videoPath).catch(() => ({ start: 0, duration: 0 }))
   const audioClock = await probeClock(ffmpeg, audioPath).catch(() => ({ start: 0, duration: 0 }))
   const inputs = alignedInputs(videoPath, audioPath, videoClock.start, audioClock.start)
-  const mux = ['-map', '0:v:0', '-map', '1:a:0', '-avoid_negative_ts', 'make_zero', '-max_interleave_delta', '0', '-movflags', '+faststart']
+  const mux = ['-map', '0:v:0', '-map', '1:a:0', '-avoid_negative_ts', 'make_zero', '-max_interleave_delta', '0', '-movflags', '+faststart', '-shortest']
   try {
     await run(ffmpeg, [...inputs, ...mux, '-c', 'copy', outputPath], 300000)
     if (await outputLooksCut(ffmpeg, outputPath, videoClock.duration, audioClock.duration)) {
@@ -245,7 +245,6 @@ export async function mergeMedia(videoPath: string, audioPath: string, outputPat
     }
   } catch (copyError) {
     try {
-      const audioLonger = audioClock.duration > 0 && videoClock.duration > 0 && audioClock.duration - videoClock.duration > 0.15
       const args = [
         ...inputs,
         ...mux,
@@ -258,7 +257,6 @@ export async function mergeMedia(videoPath: string, audioPath: string, outputPat
         '-af',
         'aresample=async=1:first_pts=0'
       ]
-      if (audioLonger) args.push('-shortest')
       await run(ffmpeg, [...args, outputPath], 300000)
     } catch (encodeError) {
       const copyMsg = copyError instanceof Error ? copyError.message : String(copyError)

@@ -504,36 +504,71 @@ function selectedBrowserLabel(): string {
   return browsers.find((item) => item.id === id)?.label || select?.selectedOptions[0]?.text || ''
 }
 
+function fileLabel(path: string): string {
+  const name = path.split('/').pop() || path
+  if (/\.audio(\.\d+)?\.[^.]+$/.test(name)) return `音轨 · ${name}`
+  if (/\.video(\.\d+)?\.[^.]+$/.test(name)) return `视频轨 · ${name}`
+  return name
+}
+
+function prettyUri(uri: string, pageUrl: string): string {
+  if (pageUrl && uri === pageUrl) return uri
+  try {
+    const parsed = new URL(uri)
+    if (parsed.hostname.includes('googlevideo.com')) {
+      const mime = parsed.searchParams.get('mime') || ''
+      const kind = mime.startsWith('audio') ? '音轨' : mime.startsWith('video') ? '视频轨' : '媒体'
+      return `${parsed.hostname} · ${kind}`
+    }
+    return uri
+  } catch {
+    return uri
+  }
+}
+
 function renderInspector(): void {
   if (!selected || !detail) {
     inspector.hidden = true
     return
   }
   const task = detail.task
+  const youtube = task.kind === 'youtube' || Boolean(task.pageUrl)
   inspector.hidden = false
   inspector.innerHTML = `
     <h2>${escapeHtml(task.name)}</h2>
     <p class="kv">
       <b>${task.connections} 条并行连接</b><br />
       分片 ${task.numPieces || '—'} · 片长 ${task.pieceLength ? formatBytes(task.pieceLength, 0) : '—'}<br />
-      GID ${task.gid}${task.infoHash ? `<br />InfoHash ${task.infoHash}` : ''}
+      GID ${escapeHtml(task.gid)}${task.infoHash ? `<br />InfoHash ${task.infoHash}` : ''}
     </p>
+    ${
+      youtube
+        ? '<p class="kv">YouTube 音画分轨会合成一个文件。下面的 CDN 是同一条签名地址按分片计数，不是多个片源。</p>'
+        : ''
+    }
     ${renderLanes(task)}
     ${renderPieces(task)}
     <h3>文件</h3>
     ${detail.files
       .map(
         (file) => `<div class="file-row">
-          <label><input type="checkbox" data-file="${file.index}" ${file.selected ? 'checked' : ''} /> ${escapeHtml(file.path.split('/').pop() || file.path)}</label>
+          <label><input type="checkbox" data-file="${file.index}" ${file.selected ? 'checked' : ''} /> ${escapeHtml(fileLabel(file.path))}</label>
           <span>${formatBytes(file.completed)} / ${formatBytes(file.length)}</span>
         </div>`
       )
       .join('')}
     <h3>源</h3>
-    ${detail.uris.map((uri) => `<div class="uri-row"><span>${escapeHtml(uri.uri)}</span><span>${uri.status}</span></div>`).join('') || '<div class="kv">暂无</div>'}
+    ${
+      detail.uris
+        .map(
+          (uri) =>
+            `<div class="uri-row"><span title="${escapeHtml(uri.uri)}">${escapeHtml(prettyUri(uri.uri, task.pageUrl))}</span><span>${escapeHtml(uri.status)}</span></div>`
+        )
+        .join('') || '<div class="kv">暂无</div>'
+    }
     <div class="row-actions" style="margin-top:10px">
-      <button data-insp="mirror">添加镜像</button>
-      <button data-insp="copy">复制全部链接</button>
+      ${youtube ? '' : '<button data-insp="mirror">添加镜像</button>'}
+      <button data-insp="copy">${youtube ? '复制视频链接' : '复制全部链接'}</button>
       <button data-insp="close">关闭</button>
     </div>
     ${
@@ -936,7 +971,7 @@ list.addEventListener('click', (event) => {
 inspector.addEventListener('click', async (event) => {
   const button = (event.target as HTMLElement).closest('button')
   if (!button || !selected) return
-  const gid = selected.split(',')[0]
+  const gid = selected
   const act = button.dataset.insp
   if (act === 'close') {
     selected = null
@@ -945,7 +980,7 @@ inspector.addEventListener('click', async (event) => {
   }
   if (act === 'copy') {
     const urls = await window.aria.copyUrls(gid)
-    showToast(`已复制 ${urls.length} 条`)
+    showToast(urls.length === 1 ? '已复制视频链接' : `已复制 ${urls.length} 条`)
   }
   if (act === 'mirror') {
     const uri = window.prompt('添加镜像 URL（同一文件的另一个源）')

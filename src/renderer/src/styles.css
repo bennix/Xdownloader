@@ -520,6 +520,18 @@ input:-webkit-autofill:focus {
   font-size: 12px;
 }
 
+.uri-row span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: break-all;
+}
+
+.uri-row span:last-child {
+  flex: 0 0 auto;
+  color: var(--quiet);
+}
+
 .tool-row {
   display: flex;
   justify-content: space-between;

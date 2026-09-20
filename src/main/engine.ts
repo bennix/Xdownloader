@@ -391,11 +391,21 @@ export class AriaEngine {
   }
 
   async urlsOf(gid: string): Promise<string[]> {
-    const page = this.youtubePages.get(gid)
-    if (page) return [page]
+    const ids = String(gid ?? '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
+    for (const id of ids) {
+      const page = this.youtubePages.get(id)
+      if (page) return [page]
+    }
     if (!this.rpc) return []
-    const files = await this.rpc.call<RawFile[]>('aria2.getFiles', [gid])
-    return unique(files.flatMap((file) => (file.uris ?? []).map((item) => item.uri ?? '')).filter(Boolean))
+    const collected: string[] = []
+    for (const id of ids) {
+      const files = await this.rpc.call<RawFile[]>('aria2.getFiles', [id]).catch(() => [])
+      collected.push(...files.flatMap((file) => (file.uris ?? []).map((item) => item.uri ?? '')).filter(Boolean))
+    }
+    return unique(collected)
   }
 
   async maybeMerge(gid: string): Promise<void> {
@@ -500,10 +510,12 @@ export class AriaEngine {
       .split(',')
       .map((item) => item.trim())
       .filter(Boolean)
+    const parts: TaskDetail[] = []
     for (const id of ids) {
       const one = await this.detailOne(id).catch(() => null)
-      if (one) return one
+      if (one) parts.push(one)
     }
+    if (parts.length) return combineDetails(parts)
     return this.detailFromCache(ids)
   }
 
@@ -531,7 +543,7 @@ export class AriaEngine {
     const task = mapTask(status, lanes)
     if (this.youtubeGids.has(task.gid)) task.kind = 'youtube'
     task.pageUrl = this.youtubePages.get(task.gid) || ''
-    return {
+    return finalizeDetail({
       task,
       files: mappedFiles,
       uris: (uris ?? []).map((item) => ({ uri: item.uri ?? '', status: item.status ?? '' })),
@@ -550,13 +562,13 @@ export class AriaEngine {
         seeder: peer.seeder === 'true'
       })),
       options: options ?? {}
-    }
+    })
   }
 
   private detailFromCache(ids: string[]): TaskDetail | null {
     const task = this.cachedTasks.find((item) => ids.includes(item.gid))
     if (!task) return null
-    return {
+    return finalizeDetail({
       task,
       files: task.files,
       uris: unique([...task.urls, ...task.files.flatMap((file) => file.uris.map((item) => item.uri))]).map((uri) => ({
@@ -566,7 +578,7 @@ export class AriaEngine {
       servers: [],
       peers: [],
       options: {}
-    }
+    })
   }
 
   async changeUris(gid: string, add: string[], del: string[] = []): Promise<void> {
@@ -1058,7 +1070,13 @@ export class AriaEngine {
       ...this.taskOptions(payload),
       out: filename,
       referer: pageUrl,
-      header: stream.headers
+      header: stream.headers,
+      split: '4',
+      'max-connection-per-server': '4',
+      'min-split-size': '8M',
+      'enable-http-pipelining': 'false',
+      'stream-piece-selector': 'inorder',
+      'check-integrity': 'false'
     }
     const gid = await this.rpc.call<string>('aria2.addUri', [[stream.url], options])
     this.youtubeGids.add(gid)
@@ -1226,6 +1244,57 @@ function emptySnapshot(settings: Settings, error: string, version: string, featu
     cookieBrowser: '',
     cookieLabel: ''
   }
+}
+
+function collapseUris(uris: { uri: string; status: string }[]): { uri: string; status: string }[] {
+  const map = new Map<string, Map<string, number>>()
+  for (const item of uris) {
+    if (!item.uri) continue
+    const bucket = map.get(item.uri) ?? new Map<string, number>()
+    const status = item.status || 'used'
+    bucket.set(status, (bucket.get(status) ?? 0) + 1)
+    map.set(item.uri, bucket)
+  }
+  return [...map.entries()].map(([uri, counts]) => {
+    const total = [...counts.values()].reduce((sum, n) => sum + n, 0)
+    const parts = [...counts.entries()].map(([status, n]) => (n > 1 ? `${status} ×${n}` : status))
+    return { uri, status: total > 1 ? `${parts.join(' · ')} · 同一地址` : parts.join(' · ') }
+  })
+}
+
+function finalizeDetail(detail: TaskDetail): TaskDetail {
+  const page = detail.task.pageUrl
+  let uris = collapseUris(detail.uris)
+  if (page && !uris.some((item) => item.uri === page)) {
+    uris = [{ uri: page, status: '页面' }, ...uris]
+  }
+  return { ...detail, uris }
+}
+
+function combineDetails(parts: TaskDetail[]): TaskDetail {
+  if (parts.length === 1) return finalizeDetail(parts[0])
+  const main = [...parts].sort((a, b) => b.task.total - a.task.total)[0]
+  const pageUrl = parts.find((item) => item.task.pageUrl)?.task.pageUrl || ''
+  return finalizeDetail({
+    task: {
+      ...main.task,
+      gid: parts.map((item) => item.task.gid).join(','),
+      name: main.task.name.replace(/\.(video|audio)(\.\d+)?(?=\.[^.]+$)/, ''),
+      pageUrl,
+      connections: parts.reduce((sum, item) => sum + item.task.connections, 0),
+      completed: parts.reduce((sum, item) => sum + item.task.completed, 0),
+      total: parts.reduce((sum, item) => sum + item.task.total, 0),
+      speed: parts.reduce((sum, item) => sum + item.task.speed, 0),
+      lanes: parts.flatMap((item) => item.task.lanes)
+    },
+    files: parts.flatMap((item, index) =>
+      item.files.map((file, fileIndex) => ({ ...file, index: index * 100 + (file.index || fileIndex + 1) }))
+    ),
+    uris: parts.flatMap((item) => item.uris),
+    servers: parts.flatMap((item) => item.servers),
+    peers: parts.flatMap((item) => item.peers),
+    options: main.options
+  })
 }
 
 function num(value: string | undefined): number {
