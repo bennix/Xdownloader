@@ -297,9 +297,9 @@ app.whenReady().then(async () => {
     }
     if (method === 'aria2.onBtDownloadComplete') notify('BT 下载完成，开始做种', gid)
     if (method === 'aria2.onDownloadError') notify('下载出错', gid)
-    if (method === 'aria.onYoutubeResolve') notify('正在解析 YouTube', gid)
+    if (method === 'aria.onYoutubeResolve') notify('正在解析视频', gid)
     if (method === 'aria.onYoutubeMerge') notify('正在合成音画', gid)
-    if (method === 'aria.onYoutubeMerged') notify('YouTube 视频已合成', gid)
+    if (method === 'aria.onYoutubeMerged') notify('视频已合成', gid)
     if (method === 'aria.onYoutubeMergeError') notify('音画合成失败', message || gid)
   }
   try {

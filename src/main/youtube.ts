@@ -3,6 +3,7 @@ import { existsSync, statSync } from 'node:fs'
 import { readdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { bundledTool, resourceBinDir } from './binaries'
+import { isXUrl, isYouTubeUrl } from '../shared/urls'
 
 export type YtQuality = string
 
@@ -62,25 +63,8 @@ type YtInfo = {
   entries?: (YtInfo | null)[]
 }
 
-const YT_HOSTS = new Set([
-  'youtube.com',
-  'youtu.be',
-  'm.youtube.com',
-  'music.youtube.com',
-  'youtube-nocookie.com'
-])
-
 const YT_BINARIES = ['/opt/homebrew/bin/yt-dlp', '/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp', 'yt-dlp']
 const FFMPEG_BINARIES = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg', 'ffmpeg']
-
-export function isYouTubeUrl(value: string): boolean {
-  try {
-    const host = new URL(value).hostname.replace(/^www\./, '').toLowerCase()
-    return YT_HOSTS.has(host)
-  } catch {
-    return false
-  }
-}
 
 export function findYtDlp(custom = ''): string | null {
   return firstExisting([custom, process.env.YT_DLP_PATH, bundledTool('ytdlp'), ...YT_BINARIES])
@@ -114,7 +98,7 @@ export async function probeYouTube(
   const first = flattenInfo(info)[0]
   return {
     url: pageUrl,
-    title: first?.title || first?.id || 'YouTube',
+    title: first?.title || first?.id || (isXUrl(pageUrl) ? 'X' : 'YouTube'),
     qualities: listQualities(first)
   }
 }
@@ -135,12 +119,18 @@ async function loadYouTubeInfo(
   const cached = infoCache.get(pageUrl)
   if (cached && cached.cookies === cookies && Date.now() - cached.at < 90_000) return cached.info
 
-  let lastError = 'YouTube 解析失败'
+  let lastError = isXUrl(pageUrl) ? 'X 解析失败' : 'YouTube 解析失败'
   const attempts = cookies ? [cookies, ''] : ['']
   for (const attempt of attempts) {
     try {
       const info = await fetchYouTubeInfo(pageUrl, binary, attempt, single)
-      if (!hasPlayableInfo(info)) throw new Error('没有解析到可下载格式')
+      if (!hasPlayableInfo(info)) {
+        throw new Error(
+          isXUrl(pageUrl)
+            ? '该 X 帖子没有可直接下载的视频（直播流或仅 HLS 暂不支持）'
+            : '没有解析到可下载格式'
+        )
+      }
       infoCache.set(pageUrl, { at: Date.now(), info, cookies: attempt })
       return info
     } catch (error) {
@@ -149,7 +139,7 @@ async function loadYouTubeInfo(
       if (!attempt || !shouldRetryAnonymous(lastError)) break
     }
   }
-  throw new Error(friendlyYtError(lastError))
+  throw new Error(friendlyYtError(lastError, pageUrl))
 }
 
 async function fetchYouTubeInfo(
@@ -163,10 +153,9 @@ async function fetchYouTubeInfo(
     '--no-warnings',
     '--no-update',
     '--ignore-config',
-    '--no-check-certificates',
-    '--extractor-args',
-    YT_PLAYER_CLIENTS
+    '--no-check-certificates'
   ]
+  if (isYouTubeUrl(pageUrl)) args.push('--extractor-args', YT_PLAYER_CLIENTS)
   if (single || !isPlaylistUrl(pageUrl)) args.push('--no-playlist')
   else args.push('--yes-playlist')
   if (cookiesFromBrowser) args.push('--cookies-from-browser', cookiesFromBrowser)
@@ -176,23 +165,37 @@ async function fetchYouTubeInfo(
 }
 
 function hasPlayableInfo(info: YtInfo): boolean {
-  return flattenInfo(info).some((item) => Boolean(item.formats?.length || item.url || item.requested_formats?.length))
+  return flattenInfo(info).some((item) =>
+    Boolean(
+      (item.formats ?? []).some(usable) ||
+        (item.requested_formats ?? []).some(usable) ||
+        (item.url && !/m3u8|ism|mhtml/i.test(item.ext ?? ''))
+    )
+  )
 }
 
 function shouldRetryAnonymous(message: string): boolean {
-  return /reload|not a bot|Sign in|cookies? database|Could not copy|Unable to find|locked|UNPLAYABLE/i.test(message)
+  return /reload|not a bot|Sign in|cookies? database|Could not copy|Unable to find|locked|UNPLAYABLE|not authorized|guest token|Rate-limit|HTTP Error 4|NsfwViewer/i.test(message)
 }
 
-function friendlyYtError(raw: string): string {
+function friendlyYtError(raw: string, pageUrl = ''): string {
   const text = raw.replace(/^ERROR:\s*/i, '').trim()
+  const x = isXUrl(pageUrl)
+  if (x && /No video could be found|Protected tweet|not available|login|NSFW|age/i.test(text)) {
+    return '读不到这条 X 视频。请用已登录 X 的浏览器，并确认帖子未设为保护、删除或仅限登录可见。'
+  }
   if (/page needs to be reloaded/i.test(text)) {
-    return 'YouTube 拒绝了浏览器 Cookies。请在 Brave 里打开一次该视频后再试，或换已登录的浏览器。'
+    return x
+      ? 'X 拒绝了浏览器 Cookies。请在所选浏览器里打开一次该帖子后再试。'
+      : 'YouTube 拒绝了浏览器 Cookies。请在 Brave 里打开一次该视频后再试，或换已登录的浏览器。'
   }
   if (/Sign in|not a bot/i.test(text)) {
-    return 'YouTube 要求登录验证。请选择已登录 YouTube 的本机浏览器。'
+    return x
+      ? 'X 要求登录。请选择已登录 X 的本机浏览器。'
+      : 'YouTube 要求登录验证。请选择已登录 YouTube 的本机浏览器。'
   }
   if (/unavailable/i.test(text)) {
-    return '视频不可用。请核对链接（0 和 o 不同），或确认该视频未删除/未设为私密。'
+    return '视频不可用。请核对链接，或确认该内容未删除/未设为私密。'
   }
   if (/cookies? database|Could not copy|Unable to find|locked/i.test(text)) {
     return '读不到浏览器 Cookies。请完全退出该浏览器后再试。'
@@ -231,7 +234,7 @@ export type UnmergedPair = {
 
 export async function mergeMedia(videoPath: string, audioPath: string, outputPath: string): Promise<string> {
   const ffmpeg = findFfmpeg()
-  if (!ffmpeg) throw new Error('未找到 ffmpeg，无法合成 YouTube 音画')
+  if (!ffmpeg) throw new Error('未找到 ffmpeg，无法合成音画')
   await waitFile(videoPath)
   await waitFile(audioPath)
   const dest = outputPath.replace(/\.[^.]+$/, '.mp4')
@@ -400,14 +403,22 @@ async function outputLooksCut(ffmpeg: string, file: string, videoDuration: numbe
 }
 
 export function safeFilename(title: string): string {
-  return (title || 'youtube-video').replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, 120)
+  return (title || 'video').replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, 120)
+}
+
+function mediaFallbackTitle(info: YtInfo, fallbackUrl: string, audio = false): string {
+  if (info.title) return info.title
+  if (info.id) return info.id
+  const x = isXUrl(info.webpage_url || fallbackUrl)
+  if (audio) return x ? 'X 音频' : 'YouTube 音频'
+  return x ? 'X' : 'YouTube'
 }
 
 function pickStreams(info: YtInfo, quality: YtQuality, fallbackUrl: string): ResolvedVideo | null {
   const formats = (info.formats ?? []).filter(usable)
   if (!formats.length && info.url) {
     return {
-      title: info.title || info.id || 'YouTube',
+      title: mediaFallbackTitle(info, fallbackUrl),
       pageUrl: info.webpage_url || fallbackUrl,
       progressive: toStream(info as YtFormat, info)
     }
@@ -421,7 +432,7 @@ function pickStreams(info: YtInfo, quality: YtQuality, fallbackUrl: string): Res
     const only = audio || progressive
     if (!only) return null
     return {
-      title: info.title || info.id || 'YouTube 音频',
+      title: mediaFallbackTitle(info, fallbackUrl, true),
       pageUrl: info.webpage_url || fallbackUrl,
       audio: toStream(only, info)
     }
@@ -429,7 +440,7 @@ function pickStreams(info: YtInfo, quality: YtQuality, fallbackUrl: string): Res
 
   if (progressive && (progressive.height ?? 0) >= (video?.height ?? 0) && !(video && videoRank(video) > videoRank(progressive))) {
     return {
-      title: info.title || info.id || 'YouTube',
+      title: mediaFallbackTitle(info, fallbackUrl),
       pageUrl: info.webpage_url || fallbackUrl,
       progressive: toStream(progressive, info)
     }
@@ -437,7 +448,7 @@ function pickStreams(info: YtInfo, quality: YtQuality, fallbackUrl: string): Res
 
   if (video && audio) {
     return {
-      title: info.title || info.id || 'YouTube',
+      title: mediaFallbackTitle(info, fallbackUrl),
       pageUrl: info.webpage_url || fallbackUrl,
       video: toStream(video, info),
       audio: toStream(audio, info)
@@ -446,9 +457,18 @@ function pickStreams(info: YtInfo, quality: YtQuality, fallbackUrl: string): Res
 
   if (progressive) {
     return {
-      title: info.title || info.id || 'YouTube',
+      title: mediaFallbackTitle(info, fallbackUrl),
       pageUrl: info.webpage_url || fallbackUrl,
       progressive: toStream(progressive, info)
+    }
+  }
+
+  const unlabeled = formats.filter(looksLikeProgressive).sort(byVideo)[0]
+  if (unlabeled) {
+    return {
+      title: mediaFallbackTitle(info, fallbackUrl),
+      pageUrl: info.webpage_url || fallbackUrl,
+      progressive: toStream(unlabeled, info)
     }
   }
   return null
@@ -473,12 +493,22 @@ function usable(format: YtFormat): boolean {
   return !/m3u8|ism|mhtml|websocket|rtmp/i.test(protocol)
 }
 
+function looksLikeProgressive(format: YtFormat): boolean {
+  if (!format.url || !usable(format)) return false
+  if ((format.height ?? 0) < 144 && !format.tbr) return false
+  return /mp4|mov|webm|mkv/i.test(format.ext || 'mp4')
+}
+
 function hasVideo(format: YtFormat): boolean {
-  return Boolean(format.vcodec && format.vcodec !== 'none')
+  if (format.vcodec === 'none') return false
+  if (format.vcodec) return true
+  return looksLikeProgressive(format)
 }
 
 function hasAudio(format: YtFormat): boolean {
-  return Boolean(format.acodec && format.acodec !== 'none')
+  if (format.acodec === 'none') return false
+  if (format.acodec) return true
+  return looksLikeProgressive(format)
 }
 
 function bestAtOrBelow(formats: YtFormat[], cap: number): YtFormat | undefined {

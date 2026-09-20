@@ -1,5 +1,5 @@
 import type { AddPayload, BrewProgress, BrowserOption, PieceSelector, Settings, Snapshot, Task, TaskDetail } from '../../shared/types'
-import { extractUrls, extractUrlsFromHtml, isYouTubeUrl, unique } from '../../shared/urls'
+import { extractUrls, extractUrlsFromHtml, isMediaUrl, isXUrl, isYouTubeUrl, unique } from '../../shared/urls'
 import { formatBytes, formatEta, formatSpeed, kindLabel, percent, statusLabel } from '../../shared/format'
 import './styles.css'
 
@@ -137,7 +137,14 @@ function fillBrowserFields(browserId?: string): void {
     ua.dataset.auto = '1'
   }
   const firstUrl = extractUrls(input.value)[0]
-  const nextReferer = firstUrl && isYouTubeUrl(firstUrl) ? 'https://www.youtube.com/' : firstUrl ? new URL(firstUrl).origin + '/' : ''
+  const nextReferer =
+    firstUrl && isYouTubeUrl(firstUrl)
+      ? 'https://www.youtube.com/'
+      : firstUrl && isXUrl(firstUrl)
+        ? 'https://x.com/'
+        : firstUrl
+          ? new URL(firstUrl).origin + '/'
+          : ''
   if (referer && referer.dataset.auto !== '0' && referer.value !== nextReferer) {
     referer.value = nextReferer
     referer.dataset.auto = '1'
@@ -221,9 +228,10 @@ async function addFromText(text: string): Promise<void> {
     const result = await window.aria.addDownloads(payload)
     if (!result.ok) showToast(result.error || '添加失败')
     else {
-      const yt = payload.uris.some(isYouTubeUrl)
+      const media = payload.uris.filter(isMediaUrl)
       const quality = $<HTMLSelectElement>('yt-quality').selectedOptions[0]?.text || payload.youtubeQuality
-      showToast(yt ? `已按 ${quality} 添加 YouTube 任务` : payload.multiSource ? `已按 ${payload.uris.length} 源并行添加` : `已添加 ${result.added} 个任务`)
+      const site = media.some(isXUrl) && media.some(isYouTubeUrl) ? 'YouTube / X' : media.some(isXUrl) ? 'X' : 'YouTube'
+      showToast(media.length ? `已按 ${quality} 添加 ${site} 任务` : payload.multiSource ? `已按 ${payload.uris.length} 源并行添加` : `已添加 ${result.added} 个任务`)
       input.value = ''
     }
   } finally {
@@ -515,7 +523,7 @@ function prettyUri(uri: string, pageUrl: string): string {
   if (pageUrl && uri === pageUrl) return uri
   try {
     const parsed = new URL(uri)
-    if (parsed.hostname.includes('googlevideo.com')) {
+    if (parsed.hostname.includes('googlevideo.com') || parsed.hostname.includes('twimg.com')) {
       const mime = parsed.searchParams.get('mime') || ''
       const kind = mime.startsWith('audio') ? '音轨' : mime.startsWith('video') ? '视频轨' : '媒体'
       return `${parsed.hostname} · ${kind}`
@@ -532,7 +540,7 @@ function renderInspector(): void {
     return
   }
   const task = detail.task
-  const youtube = task.kind === 'youtube' || Boolean(task.pageUrl)
+  const media = task.kind === 'youtube' || task.kind === 'x' || Boolean(task.pageUrl)
   inspector.hidden = false
   inspector.innerHTML = `
     <h2>${escapeHtml(task.name)}</h2>
@@ -542,8 +550,8 @@ function renderInspector(): void {
       GID ${escapeHtml(task.gid)}${task.infoHash ? `<br />InfoHash ${task.infoHash}` : ''}
     </p>
     ${
-      youtube
-        ? '<p class="kv">YouTube 音画分轨会合成一个文件。下面的 CDN 是同一条签名地址按分片计数，不是多个片源。</p>'
+      media
+        ? `<p class="kv">${task.kind === 'x' ? 'X' : 'YouTube'} 音画分轨会合成一个文件。下面的 CDN 是同一条签名地址按分片计数，不是多个片源。</p>`
         : ''
     }
     ${renderLanes(task)}
@@ -567,8 +575,8 @@ function renderInspector(): void {
         .join('') || '<div class="kv">暂无</div>'
     }
     <div class="row-actions" style="margin-top:10px">
-      ${youtube ? '' : '<button data-insp="mirror">添加镜像</button>'}
-      <button data-insp="copy">${youtube ? '复制视频链接' : '复制全部链接'}</button>
+      ${media ? '' : '<button data-insp="mirror">添加镜像</button>'}
+      <button data-insp="copy">${media ? '复制视频链接' : '复制全部链接'}</button>
       <button data-insp="close">关闭</button>
     </div>
     ${
@@ -648,12 +656,12 @@ function renderSettings(): void {
       <label>全局限速 KiB/s<input id="set-speed" type="number" min="0" value="${s.maxSpeedKib}" /></label>
       <label>做种比<input id="set-seed" type="number" min="0" step="0.1" value="${s.seedRatio}" /></label>
       <label>代理<input id="set-proxy" value="${escapeHtml(s.allProxy)}" placeholder="http://127.0.0.1:7890" /></label>
-      <label>YouTube 默认清晰度
+      <label>默认清晰度
         <select id="set-ytq">
           ${['best', '2160', '1440', '1080', '720', '480', '360', 'audio'].map((v) => `<option value="${v}" ${s.youtubeQuality === v ? 'selected' : ''}>${v === 'best' ? '最佳画质' : v === 'audio' ? '仅音频' : v + 'p'}</option>`).join('')}
         </select>
       </label>
-      <label>YouTube 登录 Cookies
+      <label>登录 Cookies（YouTube / X）
         <select id="set-cookies">
           <option value="auto" ${s.ytCookiesFromBrowser === 'auto' ? 'selected' : ''}>自动使用已登录浏览器</option>
           ${snap.browsers.map((item) => `<option value="${item.id}" ${s.ytCookiesFromBrowser === item.id ? 'selected' : ''}>${escapeHtml(item.label)}</option>`).join('')}
@@ -762,7 +770,7 @@ if (window.aria) {
   window.aria.onAddClipboard(() => void addClipboard())
   window.aria.onCopyInputUrls(() => void copyInputUrls())
   window.aria.onEvent((event) => {
-    if (event.method === 'aria2.onDownloadComplete') showToast('分片已下完，若是 YouTube 会自动合成音画')
+    if (event.method === 'aria2.onDownloadComplete') showToast('分片已下完，若是 YouTube / X 会自动合成音画')
     if (event.method === 'aria2.onDownloadError') showToast('有任务出错')
     if (event.method === 'aria.onYoutubeMerge') showToast('正在把音轨合成进视频…')
     if (event.method === 'aria.onYoutubeMerged') showToast('已合成有声 MP4')
@@ -855,7 +863,7 @@ input.addEventListener('paste', (event) => {
 })
 
 async function probeQuality(): Promise<void> {
-  const url = extractUrls(input.value).find(isYouTubeUrl)
+  const url = extractUrls(input.value).find(isMediaUrl)
   const select = $<HTMLSelectElement>('yt-quality')
   if (!url) return
   const previous = select.value

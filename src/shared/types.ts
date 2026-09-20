@@ -1,6 +1,6 @@
 export type UriSelector = 'inorder' | 'feedback' | 'adaptive'
 export type PieceSelector = 'default' | 'inorder' | 'random' | 'geom'
-export type TaskKind = 'http' | 'ftp' | 'bt' | 'magnet' | 'metalink' | 'youtube'
+export type TaskKind = 'http' | 'ftp' | 'bt' | 'magnet' | 'metalink' | 'youtube' | 'x'
 export type YtQuality = string
 
 export type YtQualityOption = {

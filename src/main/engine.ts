@@ -4,7 +4,7 @@ import { mkdir, readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import type { AddPayload, ConnectionLane, Settings, Snapshot, Task, TaskDetail, TaskFile, TaskKind, YtQuality } from '../shared/types'
-import { classifyUrl, isDownloadUrl, isYouTubeUrl, normalizeDownloadUrl, unique, youtubeVideoId } from '../shared/urls'
+import { classifyUrl, isDownloadUrl, isMediaUrl, isXUrl, isYouTubeUrl, mediaPageId, normalizeDownloadUrl, unique } from '../shared/urls'
 import { bundledTool, resourceBinDir } from './binaries'
 import { AriaRpc, unwrapMulticall } from './rpc'
 import { listBrowserOptions, resolveCookiesArg } from './browsers'
@@ -232,8 +232,8 @@ export class AriaEngine {
     const laneMap = await this.collectLanes(active.map((item) => item.gid ?? ''))
     const tasks = [...active, ...waiting, ...stopped].map((item) => {
       const task = mapTask(item, laneMap.get(item.gid ?? '') ?? [])
-      if (this.youtubeGids.has(task.gid)) task.kind = 'youtube'
       task.pageUrl = this.youtubePages.get(task.gid) || ''
+      if (this.youtubeGids.has(task.gid)) task.kind = mediaTaskKind(task.pageUrl, task.urls)
       return task
     })
     for (const task of tasks) {
@@ -278,19 +278,24 @@ export class AriaEngine {
     const uris = unique(payload.uris.map((item) => normalizeDownloadUrl(item.trim())).filter(isDownloadUrl))
     if (!uris.length) return { ok: false, added: 0, error: '没有可用的下载链接' }
 
-    const youtube = uris.filter(isYouTubeUrl)
-    const rest = uris.filter((uri) => !isYouTubeUrl(uri) && !this.isFinishedUrl(uri))
+    const media = uris.filter(isMediaUrl)
+    const rest = uris.filter((uri) => {
+      if (isMediaUrl(uri) || this.isFinishedUrl(uri)) return false
+      if (media.some(isYouTubeUrl) && /googlevideo\.com/i.test(uri)) return false
+      if (media.some(isXUrl) && /twimg\.com/i.test(uri)) return false
+      return true
+    })
     let added = 0
     try {
-      if (youtube.length) {
-        const yt = await this.addYouTube(youtube, payload)
+      if (media.length) {
+        const yt = await this.addYouTube(media, payload)
         if (!yt.ok && !rest.length) return yt
         added += yt.added
         if (!yt.ok) this.error = yt.error ?? this.error
       }
       if (!rest.length) {
         if (added) return { ok: true, added }
-        const already = uris.some((uri) => this.isFinishedUrl(uri) || (isYouTubeUrl(uri) && this.alreadyHaveYouTube(uri)))
+        const already = uris.some((uri) => this.isFinishedUrl(uri) || (isMediaUrl(uri) && this.alreadyHaveYouTube(uri)))
         return { ok: false, added: 0, error: already ? '已经下载完成，不会重复添加' : '没有可用的下载链接' }
       }
 
@@ -433,7 +438,7 @@ export class AriaEngine {
       const pageUrl = this.youtubePages.get(job.videoGid) || this.youtubePages.get(job.audioGid) || ''
       await this.remove(job.videoGid, false).catch(() => undefined)
       await this.remove(job.audioGid, false).catch(() => undefined)
-      this.rememberMerged(dest, pageUrl, 'youtube')
+      this.rememberMerged(dest, pageUrl, mediaTaskKind(pageUrl))
       await this.rpc.call('aria2.saveSession').catch(() => undefined)
       const index = this.mergeJobs.indexOf(job)
       if (index >= 0) this.mergeJobs.splice(index, 1)
@@ -551,8 +556,8 @@ export class AriaEngine {
     const mappedFiles = (files ?? []).map(mapFile)
     const lanes = flattenServers(servers)
     const task = mapTask(status, lanes)
-    if (this.youtubeGids.has(task.gid)) task.kind = 'youtube'
     task.pageUrl = this.youtubePages.get(task.gid) || ''
+    if (this.youtubeGids.has(task.gid)) task.kind = mediaTaskKind(task.pageUrl, task.urls)
     return finalizeDetail({
       task,
       files: mappedFiles,
@@ -813,10 +818,10 @@ export class AriaEngine {
 
   private alreadyHaveYouTube(url: string): boolean {
     if (this.hasYoutubePage(url)) return true
-    const id = youtubeVideoId(url)
+    const id = mediaPageId(url)
     return this.history.some((item) => {
       if (!item.pageUrl) return false
-      const same = id ? youtubeVideoId(item.pageUrl) === id : item.pageUrl === url
+      const same = id ? mediaPageId(item.pageUrl) === id : item.pageUrl === url
       return same && (!item.path || existsSync(item.path))
     })
   }
@@ -1041,8 +1046,8 @@ export class AriaEngine {
   }
 
   private hasYoutubePage(url: string): boolean {
-    const id = youtubeVideoId(url)
-    return [...this.youtubePages.values()].some((item) => (id ? youtubeVideoId(item) === id : item === url))
+    const id = mediaPageId(url)
+    return [...this.youtubePages.values()].some((item) => (id ? mediaPageId(item) === id : item === url))
   }
 
   private cookieState() {
@@ -1096,7 +1101,7 @@ export class AriaEngine {
         this.addingPages.delete(url)
       }
     }
-    if (!added) return { ok: false, added: 0, error: lastError || '没有解析到可下载的 YouTube 视频' }
+    if (!added) return { ok: false, added: 0, error: lastError || '没有解析到可下载的视频' }
     return { ok: true, added, error: lastError || undefined }
   }
 
@@ -1235,7 +1240,7 @@ function keepSessionEntry(block: string, downloadDir: string): boolean {
     const merged = guessMergedOutput(path)
     if (merged) return false
   }
-  if (/googlevideo\.com/i.test(uri) && path && /\.(video|audio)(\.\d+)?\.[^.]+$/.test(path)) {
+  if (/(?:googlevideo|twimg)\.com/i.test(uri) && path && /\.(video|audio)(\.\d+)?\.[^.]+$/.test(path)) {
     const stem = path.replace(/\.(video|audio)(\.\d+)?\.[^.]+$/, '')
     if (['.mp4', '.mkv', '.webm', '.m4a'].some((ext) => existsSync(`${stem}${ext}`))) return false
   }
@@ -1309,8 +1314,14 @@ function detectKind(raw: RawStatus, urls: string[]): TaskKind {
   if (raw.infoHash || raw.bittorrent) return urls.some((url) => url.startsWith('magnet:')) ? 'magnet' : 'bt'
   if (raw.followedBy?.length) return 'metalink'
   if (urls.some((url) => classifyUrl(url) === 'youtube' || /googlevideo\.com/i.test(url))) return 'youtube'
+  if (urls.some((url) => classifyUrl(url) === 'x' || /twimg\.com/i.test(url))) return 'x'
   if (urls.some((url) => classifyUrl(url) === 'ftp')) return 'ftp'
   return 'http'
+}
+
+function mediaTaskKind(pageUrl: string, urls: string[] = []): TaskKind {
+  if (isXUrl(pageUrl) || urls.some((url) => classifyUrl(url) === 'x' || /twimg\.com/i.test(url))) return 'x'
+  return 'youtube'
 }
 
 function taskName(raw: RawStatus, files: TaskFile[]): string {

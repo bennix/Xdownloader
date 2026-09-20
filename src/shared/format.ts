@@ -58,6 +58,8 @@ export function kindLabel(kind: string): string {
       return 'FTP'
     case 'youtube':
       return 'YouTube'
+    case 'x':
+      return 'X'
     default:
       return 'HTTP'
   }
