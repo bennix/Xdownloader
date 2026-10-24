@@ -1,6 +1,8 @@
-import type { AddPayload, BrewProgress, BrowserOption, PieceSelector, Settings, Snapshot, Task, TaskDetail } from '../../shared/types'
-import { extractUrls, extractUrlsFromHtml, isMediaUrl, isXUrl, isYouTubeUrl, unique } from '../../shared/urls'
+declare global { interface Window { aria: import('../../shared/types').AriaApi } }
+import type { AddPayload, BrewProgress, BrowserOption, PieceSelector, Settings, Snapshot, SniffHit, Task, TaskDetail } from '../../shared/types'
+import { extractUrls, extractUrlsFromHtml, isHlsUrl, isMediaUrl, isXUrl, isYouTubeUrl, unique } from '../../shared/urls'
 import { formatBytes, formatEta, formatSpeed, kindLabel, percent, statusLabel } from '../../shared/format'
+import { SubmissionQueue, sniffPayload, filterTasks, pendingSubmissionCount } from '../../shared/submissions'
 import './styles.css'
 
 type Filter = 'all' | 'active' | 'waiting' | 'done'
@@ -12,7 +14,9 @@ const list = $<HTMLElement>('list')
 const speeds = $<HTMLElement>('speeds')
 const engineTag = $<HTMLElement>('engine-tag')
 const banner = $<HTMLElement>('clip-banner')
+const sniffPanel = $<HTMLElement>('sniff-panel')
 const toast = $<HTMLElement>('toast')
+let sniffHits: SniffHit[] = []
 const inspector = $<HTMLElement>('inspector')
 const settingsEl = $<HTMLElement>('settings')
 const dropzone = $<HTMLElement>('dropzone')
@@ -212,31 +216,61 @@ function currentPayload(): AddPayload {
   }
 }
 
-let adding = false
+const submissionPanel = document.createElement('div')
+submissionPanel.className = 'sniff-panel'
+input.parentElement!.append(submissionPanel)
+const SUBMIT_LABEL = { queued: '等待提交', running: '正在提交', done: '已受理', error: '提交失败' } as const
+const submissions = new SubmissionQueue(payload => window.aria.addDownloads(payload), () => {
+  submissionPanel.hidden = !submissions.items.length
+  const rows = submissions.items.slice(-20).map(item => {
+    const row = document.createElement('div')
+    row.className = 'submission-row'
+    const text = document.createElement('span')
+    text.textContent = `${item.payload.uris.length} 条 · ${SUBMIT_LABEL[item.state]} · ${item.message || item.payload.uris[0] || ''}`
+    text.title = item.payload.uris.join('\n')
+    row.append(text)
+    if (item.state === 'error') {
+      const retry = document.createElement('button')
+      retry.textContent = '重试'
+      retry.onclick = () => submissions.retry(item.id)
+      row.append(retry)
+    }
+    if (item.state !== 'running') {
+      const del = document.createElement('button')
+      del.textContent = '删除'
+      del.title = '只删除这条提交记录，不影响已加入的下载任务'
+      del.onclick = () => submissions.remove(item.id)
+      row.append(del)
+    }
+    return row
+  })
+  const head = document.createElement('div')
+  head.className = 'row-actions'
+  const clear = document.createElement('button')
+  clear.textContent = '清空已完成记录'
+  clear.onclick = () => {
+    const n = submissions.clearSettled()
+    showToast(n ? `已清除 ${n} 条提交记录` : '没有可清除的记录')
+  }
+  head.append(clear)
+  submissionPanel.replaceChildren(...rows, head)
+  renderList()
+  if (sniffHits.length) renderSniffPanel()
+})
+submissionPanel.hidden = true
 
 async function addFromText(text: string): Promise<void> {
-  if (adding) return
-  input.value = text
   const payload = currentPayload()
   payload.uris = extractUrls(text)
-  if (!payload.uris.length) {
-    showToast('没有识别到链接')
-    return
+  if (!payload.uris.length) { showToast('没有识别到链接'); return }
+  // Preserve context even when links were filled from the sniff panel earlier.
+  for (const url of payload.uris) {
+    const hit = sniffHits.find(item => item.url === url)
+    if (!payload.multiSource && hit) submissions.enqueue(sniffPayload(hit, payload))
+    else if (!payload.multiSource) submissions.enqueue({ ...payload, uris: [url] })
   }
-  adding = true
-  try {
-    const result = await window.aria.addDownloads(payload)
-    if (!result.ok) showToast(result.error || '添加失败')
-    else {
-      const media = payload.uris.filter(isMediaUrl)
-      const quality = $<HTMLSelectElement>('yt-quality').selectedOptions[0]?.text || payload.youtubeQuality
-      const site = media.some(isXUrl) && media.some(isYouTubeUrl) ? 'YouTube / X' : media.some(isXUrl) ? 'X' : 'YouTube'
-      showToast(media.length ? `已按 ${quality} 添加 ${site} 任务` : payload.multiSource ? `已按 ${payload.uris.length} 源并行添加` : `已添加 ${result.added} 个任务`)
-      input.value = ''
-    }
-  } finally {
-    adding = false
-  }
+  if (payload.multiSource) submissions.enqueue(payload)
+  input.value = ''
 }
 
 async function addClipboard(): Promise<void> {
@@ -268,6 +302,230 @@ async function pasteRecognizedUrls(): Promise<void> {
   showToast(`已粘贴 ${urls.length} 条链接`)
 }
 
+function uniqueHits(items: SniffHit[]): SniffHit[] {
+  const map = new Map<string, SniffHit>()
+  for (const item of items) {
+    const key = `${item.pageUrl || ''}|${item.url.split('#')[0]}`
+    const prev = map.get(key)
+    map.set(
+      key,
+      prev
+        ? {
+            ...item,
+            selected: prev.selected,
+            pageUrl: item.pageUrl,
+            headers: item.headers || prev.headers
+          }
+        : { ...item, selected: item.selected !== false }
+    )
+  }
+  return [...map.values()]
+}
+
+function selectedHits(): SniffHit[] {
+  return sniffHits.filter((item) => item.selected !== false)
+}
+
+function pageLabel(url?: string): string {
+  if (!url) return '未知页面'
+  try {
+    const parsed = new URL(url)
+    return `${parsed.hostname}${parsed.pathname.replace(/\/$/, '') || '/'}`
+  } catch {
+    return url
+  }
+}
+
+function groupedHits(): [string, { item: SniffHit; index: number }[]][] {
+  const map = new Map<string, { item: SniffHit; index: number }[]>()
+  sniffHits.forEach((item, index) => {
+    const key = item.pageUrl || ''
+    const list = map.get(key) ?? []
+    list.push({ item, index })
+    map.set(key, list)
+  })
+  return [...map.entries()]
+}
+
+function renderSniffPanel(): void {
+  if (!sniffHits.length) {
+    sniffPanel.hidden = true
+    return
+  }
+  const picked = selectedHits().length
+  const groups = groupedHits()
+  sniffPanel.hidden = false
+  sniffPanel.innerHTML = `
+    <div>嗅探到 ${sniffHits.length} 条，已选 ${picked} 条 · ${groups.length} 个页面</div>
+    <div class="sniff-hits">
+      ${groups
+        .map(
+          ([page, rows]) => `
+            <div class="sniff-page">${escapeHtml(pageLabel(page))}</div>
+            ${rows
+              .map(
+                ({ item, index }) =>
+                  `<label class="sniff-hit"><input type="checkbox" data-sniff-index="${index}" ${item.selected !== false ? 'checked' : ''} /><b>${kindLabel(item.kind)}</b><span title="${escapeHtml(item.url)}">${escapeHtml(item.url)}</span>${hitStateTag(item.url)}<button type="button" class="sniff-del" data-sniff-del="${index}" title="删除这一条">×</button></label>`
+              )
+              .join('')}
+          `
+        )
+        .join('')}
+    </div>
+    <div class="row-actions">
+      <button data-sniff="import">从浏览器导入</button>
+      <button data-sniff="more">再开一页</button>
+      <button data-sniff="all">全选</button>
+      <button data-sniff="none">全不选</button>
+      <button data-sniff="fill">填入选中</button>
+      <button data-sniff="add" class="primary">下载选中</button>
+      <button data-sniff="remove">删除选中</button>
+      <button data-sniff="remove-added">删除已加入</button>
+      <button data-sniff="close">关闭全部页面</button>
+    </div>
+  `
+}
+
+function hitStateTag(url: string): string {
+  const state = submissions.stateOf(url)
+  if (!state) return ''
+  const label = { queued: '待提交', running: '提交中', done: '已加入', error: '失败' }[state]
+  return `<em class="sniff-state ${state}">${label}</em>`
+}
+
+async function importFromBrowser(): Promise<void> {
+  const browser = $<HTMLSelectElement>('opt-browser').value
+  try {
+    const result = await window.aria.importBrowserSession(browser, extractUrls(input.value))
+    if (result.userAgent) {
+      const ua = document.getElementById('opt-ua') as HTMLInputElement | null
+      if (ua && ua.dataset.auto !== '0') {
+        ua.value = result.userAgent
+        ua.dataset.auto = '1'
+      }
+    }
+    if (result.urls.length && !input.value.trim()) applyUrlsToInput(result.urls, true)
+    const bits = [
+      result.cookies ? `${result.cookies} 条 Cookie` : '',
+      result.clearance ? `${result.clearance} 条 clearance` : '',
+      result.urls.length ? `${result.urls.length} 个标签` : ''
+    ].filter(Boolean)
+    showToast(result.error || (bits.length ? `已从 ${result.label} 导入 ${bits.join(' · ')}` : '没有读到浏览器会话'))
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '读不到浏览器会话')
+  }
+}
+
+async function openSniffer(): Promise<void> {
+  const urls = extractUrls(input.value)
+  const targets = urls.length ? urls : [input.value.trim()]
+  let opened = 0
+  let lastError = ''
+  for (const url of targets) {
+    try {
+      await window.aria.sniffOpen(url)
+      opened += 1
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : '打不开嗅探窗口'
+    }
+  }
+  const listed = await window.aria.sniffList()
+  const selected = new Map(sniffHits.map((item) => [item.url.split('#')[0], item.selected]))
+  sniffHits = uniqueHits(listed).map((item) => ({
+    ...item,
+    selected: selected.get(item.url.split('#')[0]) ?? item.selected
+  }))
+  renderSniffPanel()
+  if (opened) {
+    showToast(`已打开 ${opened} 个页面。点播放后勾选地址，用内置浏览器会话下载。`)
+    return
+  }
+  showToast(lastError || '打不开嗅探窗口')
+}
+
+sniffPanel.addEventListener('change', (event) => {
+  const box = (event.target as HTMLElement).closest('input[data-sniff-index]') as HTMLInputElement | null
+  if (!box) return
+  const index = Number(box.dataset.sniffIndex)
+  if (sniffHits[index]) sniffHits[index] = { ...sniffHits[index], selected: box.checked }
+  const label = sniffPanel.querySelector('div')
+  if (label) label.textContent = `嗅探到 ${sniffHits.length} 条，已选 ${selectedHits().length} 条`
+})
+
+function removeHits(targets: SniffHit[]): void {
+  if (!targets.length) return
+  const keys = new Set(targets.map((item) => item.url.split('#')[0]))
+  sniffHits = sniffHits.filter((item) => !keys.has(item.url.split('#')[0]))
+  void window.aria.sniffRemove([...keys])
+  renderSniffPanel()
+  showToast(`已删除 ${keys.size} 条`)
+}
+
+sniffPanel.addEventListener('click', (event) => {
+  const del = (event.target as HTMLElement).closest('button[data-sniff-del]') as HTMLButtonElement | null
+  if (del) {
+    event.preventDefault()
+    event.stopPropagation()
+    const hit = sniffHits[Number(del.dataset.sniffDel)]
+    if (hit) removeHits([hit])
+    return
+  }
+  const button = (event.target as HTMLElement).closest('button[data-sniff]') as HTMLButtonElement | null
+  if (!button) return
+  if (button.dataset.sniff === 'import') {
+    void importFromBrowser()
+    return
+  }
+  if (button.dataset.sniff === 'more') {
+    void openSniffer()
+    return
+  }
+  if (button.dataset.sniff === 'all' || button.dataset.sniff === 'none') {
+    const on = button.dataset.sniff === 'all'
+    sniffHits = sniffHits.map((item) => ({ ...item, selected: on }))
+    renderSniffPanel()
+    return
+  }
+  if (button.dataset.sniff === 'remove-added') {
+    const added = sniffHits.filter((item) => submissions.stateOf(item.url) === 'done')
+    if (!added.length) showToast('还没有已加入下载的条目')
+    else removeHits(added)
+    return
+  }
+  const picked = selectedHits()
+  const urls = picked.map((item) => item.url)
+  if (!urls.length && button.dataset.sniff !== 'close') {
+    showToast('先勾选要加入队列的地址')
+    return
+  }
+  const referer = picked.find((item) => item.pageUrl)?.pageUrl
+  if (button.dataset.sniff === 'fill') {
+    applyUrlsToInput(urls, true)
+    if (referer) {
+      const box = document.getElementById('opt-referer') as HTMLInputElement | null
+      if (box) {
+        box.value = referer
+        box.dataset.auto = '1'
+      }
+    }
+    showToast(`已填入 ${urls.length} 条选中链接`)
+    return
+  }
+  if (button.dataset.sniff === 'remove') {
+    removeHits(picked)
+    return
+  }
+  if (button.dataset.sniff === 'add') {
+    for (const hit of picked) submissions.enqueue(sniffPayload(hit, currentPayload()))
+    return
+  }
+  if (button.dataset.sniff === 'close') {
+    void window.aria.sniffClose()
+    sniffHits = []
+    sniffPanel.hidden = true
+  }
+})
+
 async function copyInputUrls(): Promise<void> {
   const urls = extractUrls(input.value)
   if (!urls.length) {
@@ -292,7 +550,7 @@ function chunkCells(task: Task): string {
   const raw = bitPieces(task.bitfield, task.numPieces)
   const max = 64
   if (!raw.length) {
-    const ratio = percent(task.completed, task.total) / 100
+    const ratio = (task.hls ? task.hls.percent ?? 0 : percent(task.completed, task.total)) / 100
     return Array.from({ length: max }, (_, i) => `<i class="piece ${i / max < ratio ? 'on' : ''}"></i>`).join('')
   }
   if (raw.length <= max) return raw.map((on) => `<i class="piece ${on ? 'on' : ''}"></i>`).join('')
@@ -319,6 +577,7 @@ type TaskGroup = {
 }
 
 function groupKey(task: Task): string {
+  if (task.gid.startsWith('hls-')) return task.gid
   if (task.pageUrl) return task.pageUrl
   return task.name.replace(/\.(video|audio)(?=(\.\d+)?\.[^.]+$)/, '').replace(/\.\d+(?=\.[^.]+$)/, '')
 }
@@ -359,7 +618,7 @@ function groupProgress(group: TaskGroup) {
             ? 'error'
             : group.tasks[0]?.status || 'waiting'
   const main = [...group.tasks].sort((a, b) => b.total - a.total)[0]
-  return { completed, total, speed, connections, status, main, p: percent(completed, total) }
+  return { completed, total, speed, connections, status, main, p: main.hls ? main.hls.percent ?? 0 : percent(completed, total) }
 }
 
 function renderGroup(group: TaskGroup): string {
@@ -373,11 +632,12 @@ function renderGroup(group: TaskGroup): string {
       <div class="meta">${groupMeta(group)}</div>
     </div>
     <div class="chunkbar" title="${main.numPieces ? `${main.numPieces} 个分片逐步完成` : `${p.toFixed(1)}%`}">${chunkCells(main)}</div>
-    <div class="row-actions">${taskActions(status)}</div>
+    <div class="row-actions">${main.resolving ? '<span>正在解析媒体，请稍候</span>' : taskActions(status, main.gid.startsWith('hls-'))}</div>
   </article>`
 }
 
-function taskActions(status: string): string {
+function taskActions(status: string, managedHls = false): string {
+  if (managedHls) return '<button type="button" data-act="copy">复制链接</button><button type="button" data-act="folder">打开目录</button><span>HLS 串行队列 · 暂不支持暂停</span>'
   const resume = status === 'paused' || status === 'waiting' ? `<button type="button" data-act="resume">继续</button>` : ''
   const pause = status === 'active' ? `<button type="button" data-act="pause">暂停</button>` : ''
   const done = status === 'complete' || status === 'error' || status === 'removed'
@@ -393,6 +653,15 @@ function groupMeta(group: TaskGroup): string {
   const { completed, total, speed, connections, status } = groupProgress(group)
   const eta = formatEta(total, completed, speed)
   const main = group.tasks[0]
+  if (main.resolving) return '正在解析媒体，尚未开始传输'
+  if (main.hls) {
+    const h = main.hls
+    return `${escapeHtml(h.phase)} · ${h.percent === null ? '进度未知' : h.percent.toFixed(1) + '%'}
+      · ${formatBytes(completed)} / ${h.totalBytes ? formatBytes(h.totalBytes) : h.totalBytesEstimate ? '约 ' + formatBytes(h.totalBytesEstimate) : '未知大小'}
+      · ${formatSpeed(speed)}${h.eta !== null ? ` · 当前流剩余 ${Math.ceil(h.eta)} 秒` : ''}
+      ${h.fragmentIndex !== null ? ` · 当前流分片 ${h.fragmentIndex} / ${h.fragmentCount ?? '未知'}` : ''}
+      ${main.error ? ` · ${escapeHtml(main.error)}` : ''}`
+  }
   return `${statusLabel(status, main.seeder, main.verifyPending)}
       · ${connections} 路
       · ${formatBytes(completed)} / ${total ? formatBytes(total) : '未知'}
@@ -438,16 +707,19 @@ function escapeHtml(value: string): string {
 }
 
 function visibleTasks(): Task[] {
-  const tasks = snap?.tasks ?? []
-  if (filter === 'active') return tasks.filter((task) => task.status === 'active')
-  if (filter === 'waiting') return tasks.filter((task) => task.status === 'waiting' || task.status === 'paused')
-  if (filter === 'done') return tasks.filter((task) => ['complete', 'error', 'removed'].includes(task.status))
-  return tasks
+  return filterTasks(snap?.tasks ?? [], filter)
 }
 
 function renderList(): void {
   const tasks = visibleTasks()
-  if (!snap?.ready && snap?.error) {
+  const pending = pendingSubmissionCount(submissions.items)
+  const waiting = filterTasks(snap?.tasks ?? [], 'waiting').length
+  if (!tasks.length && (filter === 'active' || filter === 'all') && (pending || waiting)) {
+    list.dataset.sig = ''
+    list.innerHTML = `<div class="empty">${pending ? `${pending} 项正在提交或等待解析。` : ''}${waiting ? `${waiting} 个任务排队或暂停中，请查看“等待”页。` : ''}尚无正在传输的任务。</div>`
+    return
+  }
+  if (!tasks.length && !snap?.ready && snap?.error) {
     list.dataset.sig = ''
     list.innerHTML = `<div class="empty">${escapeHtml(snap.error)}</div>`
     return
@@ -482,7 +754,7 @@ function renderList(): void {
       const hasUp = Boolean(actions.querySelector('[data-act="up"]'))
       if (el.dataset.status !== status || hasUp !== wantUp) {
         el.dataset.status = status
-        actions.innerHTML = taskActions(status)
+        actions.innerHTML = main.resolving ? '<span>正在解析媒体，请稍候</span>' : taskActions(status, main.gid.startsWith('hls-'))
       }
     }
   }
@@ -540,7 +812,7 @@ function renderInspector(): void {
     return
   }
   const task = detail.task
-  const media = task.kind === 'youtube' || task.kind === 'x' || Boolean(task.pageUrl)
+  const media = task.kind === 'youtube' || task.kind === 'x' || task.kind === 'hls' || Boolean(task.pageUrl)
   inspector.hidden = false
   inspector.innerHTML = `
     <h2>${escapeHtml(task.name)}</h2>
@@ -551,7 +823,11 @@ function renderInspector(): void {
     </p>
     ${
       media
-        ? `<p class="kv">${task.kind === 'x' ? 'X' : 'YouTube'} 音画分轨会合成一个文件。下面的 CDN 是同一条签名地址按分片计数，不是多个片源。</p>`
+        ? `<p class="kv">${
+            task.kind === 'hls'
+              ? 'HLS 分片（含 EXT-X-MAP 初始化段）按顺序下载后拼成 MP4。'
+              : `${task.kind === 'x' ? 'X' : 'YouTube'} 音画分轨会合成一个文件。下面的 CDN 是同一条签名地址按分片计数，不是多个片源。`
+          }</p>`
         : ''
     }
     ${renderLanes(task)}
@@ -624,7 +900,7 @@ function renderSettings(): void {
   const body = document.getElementById('settings-body')
   if (!body) return
   const s = snap?.settings
-  if (!s) {
+  if (!s || !snap) {
     body.innerHTML = `
       <div id="tools-box"></div>
       <h2>设置</h2>
@@ -741,6 +1017,8 @@ $('btn-settings').addEventListener('click', () => {
 })
 $('btn-settings-close').addEventListener('click', () => closeSettings())
 $('btn-add').addEventListener('click', () => void addFromText(input.value))
+$('btn-import-browser').addEventListener('click', () => void importFromBrowser())
+$('btn-sniff').addEventListener('click', () => void openSniffer())
 $('btn-copy-urls').addEventListener('click', () => void copyInputUrls())
 $('btn-clipboard').addEventListener('click', () => void addClipboard())
 
@@ -766,6 +1044,11 @@ if (window.aria) {
     banner.hidden = false
     banner.innerHTML = `剪贴板里有 ${urls.length} 条链接 <button id="clip-yes">添加并按多源下载</button> <button id="clip-copy">复制这些链接</button> <button id="clip-no">忽略</button>`
   })
+  window.aria.onSniffHits((hits) => {
+    sniffHits = uniqueHits([...sniffHits, ...hits])
+    renderSniffPanel()
+  })
+  window.aria.onSniffOpen(() => void openSniffer())
   window.aria.onPasteUrls(() => void pasteRecognizedUrls())
   window.aria.onAddClipboard(() => void addClipboard())
   window.aria.onCopyInputUrls(() => void copyInputUrls())
@@ -929,8 +1212,20 @@ async function runTaskAction(act: string, taskEl: HTMLElement): Promise<void> {
     return
   }
   if (act === 'remove') {
-    await Promise.all(gids.map((item) => window.aria.remove(item)))
-    showToast('已删除任务和文件')
+    const results = await Promise.allSettled(gids.map((item) => window.aria.remove(item)))
+    const failed = results.find((item): item is PromiseRejectedResult => item.status === 'rejected')
+    if (failed) {
+      const reason = failed.reason instanceof Error ? failed.reason.message : String(failed.reason)
+      showToast(`删除失败：${reason.replace(/^Error invoking remote method 'remove': (Error: )?/, '')}`)
+    } else showToast('已删除任务和文件')
+    if (snap) {
+      snap = { ...snap, tasks: snap.tasks.filter((task) => !gids.includes(task.gid)) }
+      paint()
+    }
+    void window.aria.snapshot().then((next) => {
+      snap = next
+      paint()
+    }).catch(() => undefined)
     return
   }
   if (act === 'copy') {
@@ -1050,8 +1345,34 @@ settingsEl.addEventListener('click', async (event) => {
   }
 })
 
+async function clearFinished(deleteFiles: boolean): Promise<void> {
+  const done = (snap?.tasks ?? []).filter((task) => ['complete', 'error', 'removed'].includes(task.status))
+  if (!done.length) {
+    showToast('没有已完成的任务')
+    return
+  }
+  if (deleteFiles && !window.confirm(`删除 ${done.length} 个已完成任务及其下载文件？此操作不可撤销。`)) return
+  const results = await Promise.allSettled(done.map((task) => window.aria.remove(task.gid, deleteFiles)))
+  const failed = results.filter((item) => item.status === 'rejected').length
+  const gids = done.map((task) => task.gid)
+  if (snap) {
+    snap = { ...snap, tasks: snap.tasks.filter((task) => !gids.includes(task.gid)) }
+    paint()
+  }
+  const what = deleteFiles ? '任务及文件' : '记录'
+  showToast(failed ? `已删除 ${done.length - failed} 个${what}，${failed} 个失败` : `已删除 ${done.length} 个${what}`)
+  void window.aria.snapshot().then((next) => {
+    snap = next
+    paint()
+  }).catch(() => undefined)
+}
+
 document.getElementById('filters')?.addEventListener('click', (event) => {
   const button = (event.target as HTMLElement).closest('button')
+  if (button?.dataset.clear) {
+    void clearFinished(button.dataset.clear === 'files')
+    return
+  }
   if (!button?.dataset.filter) return
   filter = button.dataset.filter as Filter
   for (const item of document.querySelectorAll('#filters button')) item.classList.toggle('on', item === button)

@@ -351,6 +351,22 @@ input:-webkit-autofill:focus {
 
 .toast { border-style: solid; border-color: var(--line); }
 
+.sniff-panel { display: grid; gap: 8px; }
+.sniff-panel .sniff-hits { display: grid; gap: 4px; max-height: 220px; overflow: auto; }
+.sniff-panel .sniff-page { margin-top: 6px; color: var(--text); font-size: 12px; font-weight: 600; }
+.sniff-panel .sniff-page:first-child { margin-top: 0; }
+.sniff-panel .sniff-hit { display: flex; gap: 8px; align-items: center; color: var(--quiet); font-size: 12px; cursor: pointer; }
+.sniff-panel .sniff-hit b { color: var(--signal); font-weight: 500; min-width: 4em; }
+.sniff-panel .sniff-hit span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.sniff-panel .sniff-state { flex: none; font-style: normal; font-size: 11px; padding: 0 6px; border-radius: 3px; color: var(--quiet); border: 1px solid currentColor; }
+.sniff-panel .sniff-state.done { color: var(--signal); }
+.sniff-panel .sniff-state.error { color: #c0392b; }
+.submission-row { display: flex; gap: 8px; align-items: center; font-size: 12px; }
+.submission-row span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sniff-panel .sniff-hit .sniff-del { flex: none; border: 0; background: none; color: var(--quiet); font-size: 14px; line-height: 1; padding: 0 6px; cursor: pointer; opacity: 0; }
+.sniff-panel .sniff-hit:hover .sniff-del { opacity: 1; }
+.sniff-panel .sniff-hit .sniff-del:hover { color: var(--signal); }
+
 .filters {
   display: flex;
   gap: 8px;
@@ -358,6 +374,8 @@ input:-webkit-autofill:focus {
 }
 
 .filters button.on { border-color: var(--signal); color: var(--signal); }
+.filters .filters-gap { flex: 1; }
+.filters button.danger:hover { border-color: #c0392b; color: #c0392b; }
 
 .list {
   flex: 1;

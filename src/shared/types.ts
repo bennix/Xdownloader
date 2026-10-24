@@ -1,6 +1,6 @@
 export type UriSelector = 'inorder' | 'feedback' | 'adaptive'
 export type PieceSelector = 'default' | 'inorder' | 'random' | 'geom'
-export type TaskKind = 'http' | 'ftp' | 'bt' | 'magnet' | 'metalink' | 'youtube' | 'x'
+export type TaskKind = 'http' | 'ftp' | 'bt' | 'magnet' | 'metalink' | 'youtube' | 'x' | 'hls'
 export type YtQuality = string
 
 export type YtQualityOption = {
@@ -14,6 +14,26 @@ export type YtProbe = {
   url: string
   title: string
   qualities: YtQualityOption[]
+}
+
+export type BrowserSessionImport = {
+  browser: string
+  label: string
+  userAgent: string
+  urls: string[]
+  cookies: number
+  clearance: number
+  error?: string
+}
+
+export type SniffHit = {
+  url: string
+  kind: 'hls' | 'youtube' | 'x' | 'http'
+  mime: string
+  source: 'network' | 'page'
+  pageUrl?: string
+  headers?: string[]
+  selected?: boolean
 }
 
 export type Settings = {
@@ -87,7 +107,21 @@ export type Peer = {
   seeder: boolean
 }
 
+export type HlsProgress = {
+  downloadedBytes: number
+  totalBytes: number | null
+  totalBytesEstimate: number | null
+  speed: number
+  eta: number | null
+  fragmentIndex: number | null
+  fragmentCount: number | null
+  percent: number | null
+  phase: string
+}
+
 export type Task = {
+  hls?: HlsProgress
+  resolving?: boolean
   gid: string
   status: string
   kind: TaskKind
@@ -184,12 +218,12 @@ export type BrewProgress = {
 
 export type AriaApi = {
   snapshot: () => Promise<Snapshot>
-  addDownloads: (payload: AddPayload) => Promise<{ ok: boolean; added: number; error?: string }>
+  addDownloads: (payload: AddPayload) => Promise<{ ok: boolean; added: number; existing?: number; error?: string }>
   addTorrent: (base64: string, webSeeds?: string[]) => Promise<{ ok: boolean; error?: string }>
   addMetalink: (base64: string) => Promise<{ ok: boolean; added: number; error?: string }>
   pause: (gid: string) => Promise<void>
   resume: (gid: string) => Promise<void>
-  remove: (gid: string) => Promise<void>
+  remove: (gid: string, deleteFiles?: boolean) => Promise<void>
   pauseAll: () => Promise<void>
   resumeAll: () => Promise<void>
   move: (gid: string, how: 'POS_SET' | 'POS_CUR' | 'POS_END', pos: number) => Promise<void>
@@ -205,6 +239,13 @@ export type AriaApi = {
   pickTorrent: () => Promise<string | null>
   pickMetalink: () => Promise<string | null>
   probeYouTube: (url: string, cookiesFromBrowser?: string) => Promise<YtProbe>
+  sniffOpen: (url: string) => Promise<void>
+  sniffClose: () => Promise<void>
+  sniffList: () => Promise<SniffHit[]>
+  sniffRemove: (urls: string[]) => Promise<number>
+  importBrowserSession: (browserId: string, urls?: string[]) => Promise<BrowserSessionImport>
+  onSniffHits: (cb: (hits: SniffHit[], pageUrl: string) => void) => () => void
+  onSniffOpen: (cb: () => void) => () => void
   saveSettings: (patch: Partial<Settings>) => Promise<Settings>
   listBrowsers: () => Promise<BrowserOption[]>
   brewStatus: () => Promise<BrewProgress>

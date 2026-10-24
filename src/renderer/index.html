@@ -25,7 +25,7 @@
         <textarea
           id="url-input"
           rows="2"
-          placeholder="粘贴 YouTube / X / 普通链接 / 磁力链，或拖入 .torrent .meta4。YouTube 与 X 会先解析再交给 aria2 多连接下载。"
+          placeholder="粘贴 YouTube / X / HLS(.m3u8) / 普通链接 / 磁力链，或拖入 .torrent .meta4。可从 Brave 等浏览器导入 clearance，或同时打开多个嗅探页面。"
         ></textarea>
         <div class="intake-row">
           <label class="check">
@@ -51,6 +51,8 @@
             </select>
           </label>
           <div class="spacer"></div>
+          <button id="btn-import-browser" type="button">从浏览器导入</button>
+          <button id="btn-sniff" type="button">嗅探页面</button>
           <button id="btn-copy-urls" type="button">复制链接</button>
           <button id="btn-clipboard" type="button">从剪贴板添加</button>
           <button id="btn-torrent" type="button">种子</button>
@@ -84,6 +86,7 @@
       </section>
 
       <div id="clip-banner" class="banner" hidden></div>
+      <div id="sniff-panel" class="banner sniff-panel" hidden></div>
       <div id="toast" class="toast" hidden></div>
 
       <nav class="filters" id="filters">
@@ -91,6 +94,9 @@
         <button data-filter="active">进行中</button>
         <button data-filter="waiting">排队</button>
         <button data-filter="done">已完成</button>
+        <span class="filters-gap"></span>
+        <button data-clear="records" title="从列表移除已完成和失败的任务，保留已下载的文件">清除已完成记录</button>
+        <button data-clear="files" class="danger" title="移除已完成和失败的任务，并删除对应文件">删除已完成及文件</button>
       </nav>
 
       <main id="list" class="list"></main>

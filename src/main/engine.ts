@@ -1,14 +1,18 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, type ChildProcessByStdio } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, statSync } from 'node:fs'
-import { mkdir, readdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import type { AddPayload, ConnectionLane, Settings, Snapshot, Task, TaskDetail, TaskFile, TaskKind, YtQuality } from '../shared/types'
-import { classifyUrl, isDownloadUrl, isMediaUrl, isXUrl, isYouTubeUrl, mediaPageId, normalizeDownloadUrl, unique } from '../shared/urls'
+import { classifyUrl, isDownloadUrl, isHlsUrl, isMediaUrl, isXUrl, isYouTubeUrl, mediaPageId, normalizeDownloadUrl, unique } from '../shared/urls'
 import { bundledTool, resourceBinDir } from './binaries'
+import { HlsQueue, publishHls, type HlsQueueItem } from './hls-queue'
 import { AriaRpc, unwrapMulticall } from './rpc'
+import { getImportedUserAgent, importBrowserSession } from './browser-session'
 import { listBrowserOptions, resolveCookiesArg } from './browsers'
 import {
+  downloadHlsImpersonated,
   findUnmergedPairs,
   findYtDlp,
   mergeMedia,
@@ -18,6 +22,17 @@ import {
   type ResolvedStream,
   type ResolvedVideo
 } from './youtube'
+import {
+  assembleHls,
+  attachSessionHeaders,
+  cleanupFiles,
+  downloadChunksViaSession,
+  hydrateKeys,
+  remuxLocalAv,
+  remuxToMp4,
+  resolveHls,
+  type HlsChunk
+} from './hls'
 
 const STATUS_KEYS = [
   'gid',
@@ -90,7 +105,7 @@ type RawServers = {
 }[]
 
 export class AriaEngine {
-  private child: ChildProcessWithoutNullStreams | null = null
+  private child: ChildProcessByStdio<null, import('node:stream').Readable, import('node:stream').Readable> | null = null
   private rpc: AriaRpc | null = null
   private socket: WebSocket | null = null
   private settings: Settings
@@ -105,8 +120,27 @@ export class AriaEngine {
   private readonly youtubePages = new Map<string, string>()
   private readonly addingPages = new Set<string>()
   private readonly mergeJobs: MergeJob[] = []
+  private readonly hlsJobs: HlsJob[] = []
+  private readonly managedHls = new HlsQueue<{ video: ResolvedVideo; payload: AddPayload; quality: string; dir: string; proxy: string; binary: string; browser: string }>(item => this.runManagedHls(item))
+  private managedHlsTasks(): Task[] {
+    return this.managedHls.items.map(item => ({ ...mapTask({ gid: item.id, status: item.status }, []),
+      kind: 'hls', name: item.input.video.title,
+      dir: item.input.dir, path: item.path, total: item.progress?.totalBytes ?? item.progress?.totalBytesEstimate ?? 0,
+      completed: item.progress?.downloadedBytes ?? 0,
+      speed: item.status === 'active' ? item.progress?.speed ?? 0 : 0,
+      hls: { downloadedBytes: 0, totalBytes: null, totalBytesEstimate: null, speed: 0, eta: null,
+        fragmentIndex: null, fragmentCount: null, ...item.progress,
+        percent: item.status === 'complete' ? 100 : item.progress?.percent === null || !item.progress ? null : item.percent,
+        phase: item.phase, ...(item.status !== 'active' ? { speed: 0, eta: null } : {}) },
+      error: item.error, pageUrl: item.input.video.pageUrl, urls: [item.input.video.hls!.url] }))
+  }
+  private resolvingTasks(): Task[] {
+    return [...this.addingPages].map(url => ({ ...mapTask({ gid: `resolve-${url}`, status: 'active' }, []),
+      resolving: true, name: '正在解析媒体', kind: mediaTaskKind(url), pageUrl: url, urls: [url] }))
+  }
   private cachedTasks: Task[] = []
   private history: HistoryItem[] = []
+  private dismissedPaths = new Set<string>()
   private readonly mergeFailAt = new Map<string, number>()
 
   constructor(private readonly userData: string) {
@@ -167,9 +201,9 @@ export class AriaEngine {
       this.error = `无法启动 aria2c：${err.message}`
       this.ready = false
     })
-    this.child.on('exit', (code) => {
+    this.child.on('exit', (code, signal) => {
       this.ready = false
-      if (!this.error) this.error = code ? `aria2c 已退出 (${code})` : 'aria2c 已退出'
+      if (!this.error) this.error = `aria2c 已退出 (${signal || code || 0})`
     })
 
     this.rpc = new AriaRpc(this.port, this.secret)
@@ -182,9 +216,13 @@ export class AriaEngine {
       this.error = ''
       this.connectEvents()
       await this.loadMergeJobs()
+      await this.loadHlsJobs()
+      for (const job of this.hlsJobs) {
+        if (job.gids[0]) void this.maybeAssembleHls(job.gids[0])
+      }
     } catch (error) {
       const tail = logs.join('').replace(/\s+/g, ' ').trim().slice(-240)
-      this.error = `${error instanceof Error ? error.message : String(error)}${tail ? ` · ${tail}` : ''}`
+      this.error = `${this.error ? `${this.error} · ` : ''}${error instanceof Error ? error.message : String(error)}${tail ? ` · ${tail}` : ''}`
       this.ready = false
       this.child.kill('SIGTERM')
     }
@@ -206,19 +244,35 @@ export class AriaEngine {
     this.ready = false
   }
 
-  async snapshot(): Promise<Snapshot> {
-    if (!this.rpc || !this.ready) {
-      const archived = this.history.map((item) => this.historyToTask(item))
-      this.cachedTasks = archived
-      return {
-        ...emptySnapshot(this.settings, this.error, this.version, this.features),
-        tasks: archived,
-        numStopped: archived.length,
-        ...this.cookieState()
-      }
+  snapshotFallback(error = this.error): Snapshot {
+    const managed = [...this.managedHlsTasks(), ...this.resolvingTasks()]
+    const tasks = [...managed, ...this.history.map(item => this.historyToTask(item)),
+      ...this.cachedTasks.filter(item => !item.gid.startsWith('hls-') && !item.resolving).map(item => ({
+        ...item, speed: 0, uploadSpeed: 0, connections: 0, lanes: [],
+        status: ['active', 'waiting', 'paused'].includes(item.status) ? 'unknown' : item.status
+      }))].filter((item, index, all) => all.findIndex(other => other.gid === item.gid || (item.path && other.path === item.path)) === index)
+    this.cachedTasks = tasks
+    return {
+      ...emptySnapshot(this.settings, error, this.version, this.features), tasks,
+      downloadSpeed: managed.reduce((sum, task) => sum + task.speed, 0),
+      numActive: tasks.filter(item => item.status === 'active').length,
+      numWaiting: tasks.filter(item => item.status === 'waiting').length,
+      numStopped: tasks.filter(item => ['complete', 'error', 'removed'].includes(item.status)).length,
+      ...this.cookieState()
     }
+  }
 
-    const [activeWrap, waitingWrap, stoppedWrap, statWrap] = await this.rpc.multicall([
+  async snapshot(): Promise<Snapshot> {
+    if (!this.rpc || !this.ready) return this.snapshotFallback()
+    try {
+      return await this.connectedSnapshot()
+    } catch (error) {
+      return this.snapshotFallback(error instanceof Error ? error.message : '本地 aria2 RPC 状态读取失败')
+    }
+  }
+
+  private async connectedSnapshot(): Promise<Snapshot> {
+    const [activeWrap, waitingWrap, stoppedWrap, statWrap] = await this.rpc!.multicall([
       { methodName: 'aria2.tellActive', params: [STATUS_KEYS] },
       { methodName: 'aria2.tellWaiting', params: [0, 1000, STATUS_KEYS] },
       { methodName: 'aria2.tellStopped', params: [0, 1000, STATUS_KEYS] },
@@ -243,7 +297,8 @@ export class AriaEngine {
     const extras = this.history
       .filter((item) => !tasks.some((task) => task.gid === item.gid || (item.path && task.path === item.path)))
       .map((item) => this.historyToTask(item))
-    const all = [...tasks, ...extras]
+    const managed = [...this.managedHlsTasks(), ...this.resolvingTasks()]
+    const all = [...tasks, ...extras.filter(task => !managed.some(item => item.path && item.path === task.path)), ...managed]
     this.cachedTasks = all
     void this.sweepMerges(tasks)
 
@@ -252,11 +307,11 @@ export class AriaEngine {
       error: '',
       version: this.version,
       features: this.features,
-      downloadSpeed: num(stat.downloadSpeed),
+      downloadSpeed: num(stat.downloadSpeed) + managed.reduce((sum, task) => sum + task.speed, 0),
       uploadSpeed: num(stat.uploadSpeed),
-      numActive: num(stat.numActive),
-      numWaiting: num(stat.numWaiting),
-      numStopped: Math.max(num(stat.numStopped), extras.length),
+      numActive: num(stat.numActive) + managed.filter(item => item.status === 'active').length,
+      numWaiting: num(stat.numWaiting) + managed.filter(item => item.status === 'waiting').length,
+      numStopped: all.filter(item => ['complete', 'error', 'removed'].includes(item.status)).length,
       tasks: all,
       settings: this.settings,
       ...this.cookieState()
@@ -266,15 +321,14 @@ export class AriaEngine {
   async probeYouTube(url: string, cookiesFromBrowser?: string) {
     const binary = findYtDlp(this.settings.ytDlpPath)
     if (!binary) throw new Error('未找到 yt-dlp。请先执行 brew install yt-dlp')
-    return probeYouTube(
-      url,
-      binary,
-      resolveCookiesArg(cookiesFromBrowser || this.settings.ytCookiesFromBrowser) ?? ''
-    )
+    const browser = resolveCookiesArg(cookiesFromBrowser || this.settings.ytCookiesFromBrowser) ?? ''
+    if (isHlsUrl(url) && browser) {
+      await importBrowserSession(browser, [url], binary)
+    }
+    return probeYouTube(url, binary, browser)
   }
 
-  async addDownloads(payload: AddPayload): Promise<{ ok: boolean; added: number; error?: string }> {
-    if (!this.rpc) return { ok: false, added: 0, error: '引擎未就绪' }
+  async addDownloads(payload: AddPayload): Promise<{ ok: boolean; added: number; existing?: number; error?: string }> {
     const uris = unique(payload.uris.map((item) => normalizeDownloadUrl(item.trim())).filter(isDownloadUrl))
     if (!uris.length) return { ok: false, added: 0, error: '没有可用的下载链接' }
 
@@ -286,19 +340,22 @@ export class AriaEngine {
       return true
     })
     let added = 0
+    let existing = 0
     try {
       if (media.length) {
         const yt = await this.addYouTube(media, payload)
         if (!yt.ok && !rest.length) return yt
         added += yt.added
+        existing += yt.existing ?? 0
         if (!yt.ok) this.error = yt.error ?? this.error
       }
       if (!rest.length) {
-        if (added) return { ok: true, added }
+        if (added || existing) return { ok: true, added, existing }
         const already = uris.some((uri) => this.isFinishedUrl(uri) || (isMediaUrl(uri) && this.alreadyHaveYouTube(uri)))
         return { ok: false, added: 0, error: already ? '已经下载完成，不会重复添加' : '没有可用的下载链接' }
       }
 
+      if (!this.rpc) throw new Error(`本地 aria2 RPC 未就绪 (127.0.0.1:${this.port})`)
       const options = this.taskOptions(payload)
       if (payload.multiSource) {
         const magnets = rest.filter((uri) => classifyUrl(uri) === 'magnet')
@@ -334,7 +391,7 @@ export class AriaEngine {
     }
   }
 
-  async addMetalink(base64: string): Promise<{ ok: boolean; added: number; error?: string }> {
+  async addMetalink(base64: string): Promise<{ ok: boolean; added: number; existing?: number; error?: string }> {
     if (!this.rpc) return { ok: false, added: 0, error: '引擎未就绪' }
     try {
       const gids = await this.rpc.call<string[]>('aria2.addMetalink', [base64, { dir: this.settings.downloadDir, 'force-save': 'true' }])
@@ -353,20 +410,33 @@ export class AriaEngine {
   }
 
   async remove(gid: string, deleteFiles = true): Promise<void> {
-    if (!this.rpc) return
+    const managed = this.managedHls.items.find((item) => item.id === gid)
+    if (managed) {
+      if (managed.status === 'active' || managed.status === 'waiting') throw new Error('HLS 正在下载，暂不支持中途删除')
+      this.managedHls.items.splice(this.managedHls.items.indexOf(managed), 1)
+      const files = managed.path ? [managed.path] : []
+      if (!deleteFiles) this.dismissPaths(files)
+      this.forgetHistory(gid, files)
+      if (deleteFiles) await this.unlinkOwned(files)
+      return
+    }
+    if (!deleteFiles) this.dismissPaths(this.history.filter((item) => item.gid === gid).map((item) => item.path))
     const files = deleteFiles ? await this.filePathsOf(gid) : []
     const job = this.mergeJobs.find((item) => item.videoGid === gid || item.audioGid === gid)
     if (deleteFiles && job) files.push(job.outputPath)
-    try {
-      await this.rpc.call('aria2.remove', [gid])
-    } catch {
-      await this.rpc.call('aria2.forceRemove', [gid]).catch(() => undefined)
+    if (this.rpc && this.ready && !this.history.some((item) => item.gid === gid && !/^[0-9a-f]{16}$/i.test(gid))) {
+      try {
+        await this.rpc.call('aria2.remove', [gid])
+      } catch {
+        await this.rpc.call('aria2.forceRemove', [gid]).catch(() => undefined)
+      }
+      await this.rpc.call('aria2.removeDownloadResult', [gid]).catch(() => undefined)
     }
-    await this.rpc.call('aria2.removeDownloadResult', [gid]).catch(() => undefined)
     this.youtubeGids.delete(gid)
     this.youtubePages.delete(gid)
     void this.saveYoutubePages()
     this.forgetHistory(gid, files)
+    this.cachedTasks = this.cachedTasks.filter((task) => task.gid !== gid)
     if (job && (job.videoGid === gid || job.audioGid === gid)) {
       const other = job.videoGid === gid ? job.audioGid : job.videoGid
       if (!this.youtubeGids.has(other)) {
@@ -789,6 +859,23 @@ export class AriaEngine {
     }
   }
 
+  private get hlsJobsFile(): string {
+    return join(this.userData, 'hls-jobs.json')
+  }
+
+  private async saveHlsJobs(): Promise<void> {
+    await writeFile(this.hlsJobsFile, JSON.stringify(this.hlsJobs), 'utf8').catch(() => undefined)
+  }
+
+  private async loadHlsJobs(): Promise<void> {
+    try {
+      const raw = JSON.parse(await readFile(this.hlsJobsFile, 'utf8')) as HlsJob[]
+      this.hlsJobs.splice(0, this.hlsJobs.length, ...raw.map((item) => ({ ...item, assembling: false })))
+    } catch {
+      /* first run */
+    }
+  }
+
   private get youtubePagesFile(): string {
     return join(this.userData, 'youtube-pages.json')
   }
@@ -859,6 +946,24 @@ export class AriaEngine {
     } catch {
       this.history = []
     }
+    try {
+      const raw = JSON.parse(await readFile(this.dismissedFile, 'utf8')) as string[]
+      this.dismissedPaths = new Set(Array.isArray(raw) ? raw.filter((item) => typeof item === 'string') : [])
+    } catch {
+      this.dismissedPaths = new Set()
+    }
+  }
+
+  private get dismissedFile(): string {
+    return join(this.userData, 'dismissed-files.json')
+  }
+
+  // Records the user cleared while keeping the file; the disk scan must not resurrect them.
+  private dismissPaths(paths: string[]): void {
+    const before = this.dismissedPaths.size
+    for (const path of paths) if (path) this.dismissedPaths.add(resolve(path))
+    if (this.dismissedPaths.size === before) return
+    void writeFile(this.dismissedFile, JSON.stringify([...this.dismissedPaths].slice(-2000)), 'utf8').catch(() => undefined)
   }
 
   private async saveHistory(): Promise<void> {
@@ -874,6 +979,7 @@ export class AriaEngine {
       if (/\.(video|audio)(\.\d+)?\./.test(name)) continue
       const path = join(dir, name)
       if (this.history.some((item) => item.path === path)) continue
+      if (this.dismissedPaths.has(resolve(path))) continue
       try {
         const st = statSync(path)
         if (!st.isFile() || st.size < 1024) continue
@@ -930,6 +1036,9 @@ export class AriaEngine {
   }
 
   private upsertHistory(item: HistoryItem): void {
+    if (item.path && this.dismissedPaths.delete(resolve(item.path))) {
+      void writeFile(this.dismissedFile, JSON.stringify([...this.dismissedPaths]), 'utf8').catch(() => undefined)
+    }
     this.history = this.history.filter((row) => row.gid !== item.gid && row.path !== item.path)
     this.history.unshift(item)
     if (this.history.length > 500) this.history.length = 500
@@ -1045,6 +1154,35 @@ export class AriaEngine {
     if (first) this.onEvent?.('aria.onYoutubeMergeError', key, message)
   }
 
+  async maybeAssembleHls(gid: string): Promise<void> {
+    const job = this.hlsJobs.find((item) => item.gids.includes(gid))
+    if (!job || job.assembling) return
+    const ready = job.files.every((path) => existsSync(path) && !existsSync(`${path}.aria2`))
+    if (!ready) return
+    job.assembling = true
+    this.onEvent?.('aria.onYoutubeMerge', job.outputPath)
+    try {
+      const packed = `${job.outputPath}.hlsbin`
+      await assembleHls(job.files, job.chunks, packed)
+      const dest = await remuxToMp4(packed, job.outputPath, job.container)
+      await unlink(packed).catch(() => undefined)
+      await cleanupFiles(job.files)
+      for (const id of job.gids) {
+        await this.remove(id, false).catch(() => undefined)
+      }
+      this.rememberMerged(dest, job.pageUrl, mediaTaskKind(job.pageUrl))
+      const index = this.hlsJobs.indexOf(job)
+      if (index >= 0) this.hlsJobs.splice(index, 1)
+      await this.saveHlsJobs()
+      this.onEvent?.('aria.onYoutubeMerged', dest)
+    } catch (error) {
+      job.assembling = false
+      const message = error instanceof Error ? error.message : String(error)
+      this.error = message
+      this.emitMergeError(job.outputPath, message)
+    }
+  }
+
   private hasYoutubePage(url: string): boolean {
     const id = mediaPageId(url)
     return [...this.youtubePages.values()].some((item) => (id ? mediaPageId(item) === id : item === url))
@@ -1068,15 +1206,16 @@ export class AriaEngine {
   private async addYouTube(
     urls: string[],
     payload: AddPayload
-  ): Promise<{ ok: boolean; added: number; error?: string }> {
+  ): Promise<{ ok: boolean; added: number; existing?: number; error?: string }> {
     const binary = findYtDlp(this.settings.ytDlpPath)
     if (!binary) return { ok: false, added: 0, error: '未找到 yt-dlp。请先执行 brew install yt-dlp' }
     const quality = payload.youtubeQuality || this.settings.youtubeQuality
     let added = 0
+    let existing = 0
     let lastError = ''
     for (const url of unique(urls)) {
       if (this.addingPages.has(url) || this.alreadyHaveYouTube(url)) {
-        lastError = lastError || '该视频已在任务里或已经下载完成'
+        existing += 1
         continue
       }
       this.addingPages.add(url)
@@ -1093,7 +1232,9 @@ export class AriaEngine {
           const key = video.pageUrl || video.title
           if (seen.has(key)) continue
           seen.add(key)
-          added += await this.enqueueYouTube(video, payload, quality)
+          const count = await this.enqueueYouTube(video, payload, quality)
+          if (count === -1) existing += 1
+          else added += count
         }
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error)
@@ -1101,8 +1242,8 @@ export class AriaEngine {
         this.addingPages.delete(url)
       }
     }
-    if (!added) return { ok: false, added: 0, error: lastError || '没有解析到可下载的视频' }
-    return { ok: true, added, error: lastError || undefined }
+    if (!added && !existing) return { ok: false, added: 0, error: lastError || '没有解析到可下载的视频' }
+    return { ok: true, added, existing, error: lastError || undefined }
   }
 
   private async enqueueYouTube(video: ResolvedVideo, payload: AddPayload, quality: YtQuality): Promise<number> {
@@ -1130,6 +1271,9 @@ export class AriaEngine {
       await this.saveMergeJobs()
       return 2
     }
+    if (video.hls) {
+      return this.enqueueHls(video, payload, quality)
+    }
     if (video.audio) {
       await this.addYtStream(video.audio, video.pageUrl, `${base}.${video.audio.ext}`, payload)
       return 1
@@ -1137,7 +1281,83 @@ export class AriaEngine {
     return 0
   }
 
-  private async addYtStream(stream: ResolvedStream, pageUrl: string, filename: string, payload: AddPayload): Promise<string> {
+  private async enqueueHls(video: ResolvedVideo, payload: AddPayload, quality: YtQuality): Promise<number> {
+    if (!video.hls) return 0
+    if (payload.pause) throw new Error('HLS 暂不支持暂停添加，请取消“暂停添加”')
+    const binary = findYtDlp(this.settings.ytDlpPath)
+    if (!binary) throw new Error('未找到 yt-dlp')
+    const accepted = this.managedHls.add(`${video.hls.url.split('#')[0]}|${video.hlsAudio?.url || ''}|${quality}`, {
+      video, payload, quality, binary, dir: this.settings.downloadDir, proxy: this.settings.allProxy,
+      browser: resolveCookiesArg(payload.ytCookiesFromBrowser || this.settings.ytCookiesFromBrowser) ?? ''
+    })
+    if (!accepted) return -1 // Existing task accepted; no new download was created.
+    return 1
+  }
+
+  private async runManagedHls(item: HlsQueueItem<{ video: ResolvedVideo; payload: AddPayload; quality: string; dir: string; proxy: string; binary: string; browser: string }>): Promise<void> {
+    const { video, payload, quality, dir, proxy, binary, browser } = item.input
+    const base = safeFilename(payload.out || `${video.title}.${quality}`)
+    await mkdir(dir, { recursive: true })
+    const staging = await mkdtemp(join(dir, '.hls-stage-'))
+    const destination = join(dir, `${base}-${randomUUID().slice(0, 12)}.mp4`)
+    const referer = payload.referer || (isHlsUrl(video.pageUrl) ? '' : video.pageUrl)
+    let priorBytes = 0
+    const separateTracks = Boolean(video.hlsAudio && quality !== 'audio')
+    const download = async (stream: ResolvedStream, name: string, selected: string, offset: number, weight: number) => {
+      if (item.progress) { item.progress.speed = 0; item.progress.eta = null }
+      item.phase = '验证播放列表（Chrome）'
+      // Each stream keeps its own captured context; no video/audio header union.
+      const headers = [...(payload.headers || []), ...stream.headers]
+      if (referer) headers.push(`Referer: ${referer}`)
+      const result = await downloadHlsImpersonated(binary, { url: stream.url, dest: join(staging, name), headers,
+        quality: selected, cookiesFromBrowser: browser, proxy,
+        onProgress: progress => {
+          item.percent = offset + (progress.percent ?? 0) * weight
+          item.phase = progress.phase
+          item.progress = { ...progress, downloadedBytes: priorBytes + progress.downloadedBytes,
+            // A first-track estimate is not the total size of both tracks.
+            totalBytes: separateTracks ? null : progress.totalBytes,
+            totalBytesEstimate: separateTracks ? null : progress.totalBytesEstimate }
+        }
+      })
+      priorBytes = item.progress?.downloadedBytes ?? priorBytes
+      if (item.progress) { item.progress.speed = 0; item.progress.eta = null }
+      return result
+    }
+    try {
+      item.phase = '验证播放列表（Chrome）'
+      const output = join(staging, 'output.mp4')
+      if (video.hlsAudio && quality !== 'audio') {
+        const v = await download(video.hls!, 'video.mp4', quality, 0, 0.48)
+        const a = await download(video.hlsAudio, 'audio.mp4', 'audio', 48, 0.48)
+        item.phase = '合并音视频'
+        await remuxLocalAv(v, a, output)
+      } else {
+        await download(quality === 'audio' && video.hlsAudio ? video.hlsAudio : video.hls!, 'output.mp4', quality, 0, 0.96)
+      }
+      item.phase = '发布文件'
+      await publishHls(output, destination)
+      item.path = destination
+      if (item.progress) {
+        const bytes = statSync(destination).size
+        item.progress = { ...item.progress, downloadedBytes: bytes, totalBytes: bytes, totalBytesEstimate: null,
+          speed: 0, eta: null, percent: 100 }
+      }
+      this.rememberMerged(destination, video.pageUrl, 'hls')
+      this.onEvent?.('aria.onYoutubeMerged', destination)
+    } finally {
+      // Only our private staging directory is ever removed.
+      await rm(staging, { recursive: true, force: true }).catch(() => undefined)
+    }
+  }
+
+  private async addYtStream(
+    stream: ResolvedStream,
+    pageUrl: string,
+    filename: string,
+    payload: AddPayload,
+    extra: Record<string, string> = {}
+  ): Promise<string> {
     if (!this.rpc) throw new Error('引擎未就绪')
     const options = {
       ...this.taskOptions(payload),
@@ -1149,7 +1369,8 @@ export class AriaEngine {
       'min-split-size': '8M',
       'enable-http-pipelining': 'false',
       'stream-piece-selector': 'inorder',
-      'check-integrity': 'false'
+      'check-integrity': 'false',
+      ...extra
     }
     const gid = await this.rpc.call<string>('aria2.addUri', [[stream.url], options])
     this.youtubeGids.add(gid)
@@ -1214,6 +1435,16 @@ type MergeJob = {
   videoDone: boolean
   audioDone: boolean
   merging: boolean
+}
+
+type HlsJob = {
+  gids: string[]
+  files: string[]
+  chunks: HlsChunk[]
+  outputPath: string
+  pageUrl: string
+  container: 'fmp4' | 'ts'
+  assembling: boolean
 }
 
 function keepSessionEntry(block: string, downloadDir: string): boolean {
@@ -1315,12 +1546,29 @@ function detectKind(raw: RawStatus, urls: string[]): TaskKind {
   if (raw.followedBy?.length) return 'metalink'
   if (urls.some((url) => classifyUrl(url) === 'youtube' || /googlevideo\.com/i.test(url))) return 'youtube'
   if (urls.some((url) => classifyUrl(url) === 'x' || /twimg\.com/i.test(url))) return 'x'
+  if (urls.some((url) => classifyUrl(url) === 'hls' || /\.m3u8/i.test(url))) return 'hls'
   if (urls.some((url) => classifyUrl(url) === 'ftp')) return 'ftp'
   return 'http'
 }
 
+function streamKey(...urls: (string | undefined)[]): string {
+  const stable = urls
+    .filter(Boolean)
+    .map((value) => {
+      try {
+        const url = new URL(value as string)
+        return `${url.host}${url.pathname}`
+      } catch {
+        return value as string
+      }
+    })
+    .join('|')
+  return createHash('sha1').update(stable).digest('hex').slice(0, 10)
+}
+
 function mediaTaskKind(pageUrl: string, urls: string[] = []): TaskKind {
   if (isXUrl(pageUrl) || urls.some((url) => classifyUrl(url) === 'x' || /twimg\.com/i.test(url))) return 'x'
+  if (isHlsUrl(pageUrl) || urls.some((url) => classifyUrl(url) === 'hls' || /\.m3u8/i.test(url))) return 'hls'
   return 'youtube'
 }
 

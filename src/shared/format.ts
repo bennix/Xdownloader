@@ -26,6 +26,7 @@ export function percent(completed: number, total: number): number {
 }
 
 export function statusLabel(status: string, seeder: boolean, verifyPending: boolean): string {
+  if (status === 'unknown') return '状态未知（本地 aria2 离线）'
   if (verifyPending) return '校验中'
   if (status === 'active' && seeder) return '做种'
   switch (status) {
@@ -60,6 +61,8 @@ export function kindLabel(kind: string): string {
       return 'YouTube'
     case 'x':
       return 'X'
+    case 'hls':
+      return 'HLS'
     default:
       return 'HTTP'
   }

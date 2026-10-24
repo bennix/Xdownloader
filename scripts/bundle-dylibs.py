@@ -60,6 +60,15 @@ def main() -> None:
     for real, name in seen.items():
         rewrite(os.path.join(libdir, name), names)
 
+    # install_name_tool invalidates Mach-O signatures, including copied Homebrew signatures.
+    # Sign shared libraries after all rewrites, including ones from an earlier bundle pass.
+    paths = [os.path.join(libdir, name) for name in sorted(os.listdir(libdir))
+             if name.endswith('.dylib') and not os.path.islink(os.path.join(libdir, name))]
+    paths.append(binary)
+    for path in paths:
+        subprocess.check_call(['codesign', '--force', '--sign', '-', path])
+        subprocess.check_call(['codesign', '--verify', '--strict', path])
+
 
 if __name__ == "__main__":
     main()

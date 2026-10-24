@@ -20,6 +20,14 @@ import { readClipboardUrls } from './clipboard'
 import { brewSnapshot, installMissing, onBrewProgress } from './brew'
 import { listBrowserOptions } from './browsers'
 import { AriaEngine } from './engine'
+import { importBrowserSession } from './browser-session'
+import { closeSniffer, openSniffer, removeSniffHits, setSniffListener, sniffHits } from './sniffer'
+import { findYtDlp } from './youtube'
+
+app.commandLine.appendSwitch('disable-quic')
+app.commandLine.appendSwitch('log-level', '3')
+app.commandLine.appendSwitch('disable-ipv6')
+app.commandLine.appendSwitch('disable-features', 'EncryptedClientHello,AsyncDns')
 
 let win: BrowserWindow | null = null
 let quitting = false
@@ -86,30 +94,6 @@ function createWindow(): void {
   }
 }
 
-function emptySnap(error: string) {
-  return {
-    ready: false,
-    error,
-    version: engine.version || '',
-    features: engine.features,
-    downloadSpeed: 0,
-    uploadSpeed: 0,
-    numActive: 0,
-    numWaiting: 0,
-    numStopped: 0,
-    tasks: [],
-    settings: engine.currentSettings,
-    browsers: (() => {
-      try {
-        return listBrowserOptions()
-      } catch {
-        return []
-      }
-    })(),
-    cookieBrowser: '',
-    cookieLabel: ''
-  }
-}
 
 function bindIpc(): void {
   ipcMain.handle('list-browsers', () => {
@@ -123,7 +107,7 @@ function bindIpc(): void {
     try {
       return await engine.snapshot()
     } catch (error) {
-      return emptySnap(error instanceof Error ? error.message : String(error))
+      return engine.snapshotFallback(error instanceof Error ? error.message : String(error))
     }
   })
   ipcMain.handle('add-downloads', (_event, payload: AddPayload) => engine.addDownloads(payload))
@@ -131,7 +115,7 @@ function bindIpc(): void {
   ipcMain.handle('add-metalink', (_event, base64: string) => engine.addMetalink(base64))
   ipcMain.handle('pause', (_event, gid: string) => engine.pause(gid))
   ipcMain.handle('resume', (_event, gid: string) => engine.resume(gid))
-  ipcMain.handle('remove', (_event, gid: string) => engine.remove(gid))
+  ipcMain.handle('remove', (_event, gid: string, deleteFiles = true) => engine.remove(gid, deleteFiles !== false))
   ipcMain.handle('pause-all', () => engine.pauseAll())
   ipcMain.handle('resume-all', () => engine.resumeAll())
   ipcMain.handle('move', (_event, gid: string, how: 'POS_SET' | 'POS_CUR' | 'POS_END', pos: number) =>
@@ -190,6 +174,16 @@ function bindIpc(): void {
   ipcMain.handle('probe-youtube', (_event, url: string, cookiesFromBrowser?: string) =>
     engine.probeYouTube(url, cookiesFromBrowser)
   )
+  ipcMain.handle('sniff-open', (_event, url: string) => {
+    void importBrowserSession(engine.currentSettings.ytCookiesFromBrowser, [url], findYtDlp(engine.currentSettings.ytDlpPath) ?? '')
+    return openSniffer(url, win)
+  })
+  ipcMain.handle('sniff-close', () => closeSniffer())
+  ipcMain.handle('sniff-list', () => sniffHits())
+  ipcMain.handle('sniff-remove', (_event, urls: string[]) => removeSniffHits(Array.isArray(urls) ? urls : []))
+  ipcMain.handle('import-browser-session', (_event, browserId: string, urls: string[] = []) =>
+    importBrowserSession(browserId || engine.currentSettings.ytCookiesFromBrowser, urls, findYtDlp(engine.currentSettings.ytDlpPath) ?? '')
+  )
   ipcMain.handle('brew-status', () => brewSnapshot())
   ipcMain.handle('brew-install', async (_event, auto = false) => {
     const result = await installMissing(auto)
@@ -220,16 +214,20 @@ async function pickEncoded(extensions: string[]): Promise<string | null> {
 }
 
 function startPolling(): void {
+  let polling = false
   const tick = async () => {
-    if (!win || win.isDestroyed()) return
+    if (polling || !win || win.isDestroyed()) return
+    polling = true
     try {
       const snap = await engine.snapshot()
       win.webContents.send('snapshot', snap)
       if (process.platform === 'darwin') {
-        app.dock.setBadge(snap.numActive ? String(snap.numActive) : '')
+        app.dock?.setBadge(snap.numActive ? String(snap.numActive) : '')
       }
     } catch (error) {
-      win.webContents.send('snapshot', emptySnap(error instanceof Error ? error.message : String(error)))
+      win?.webContents.send('snapshot', engine.snapshotFallback(error instanceof Error ? error.message : String(error)))
+    } finally {
+      polling = false
     }
     watchClipboard()
   }
@@ -270,6 +268,7 @@ function buildMenu(): void {
         { label: '粘贴链接', accelerator: 'CmdOrCtrl+V', click: () => win?.webContents.send('paste-urls') },
         { label: '从剪贴板添加', accelerator: 'CmdOrCtrl+Shift+V', click: () => win?.webContents.send('add-clipboard') },
         { label: '添加种子…', click: () => win?.webContents.send('add-torrent') },
+        { label: '嗅探页面', accelerator: 'CmdOrCtrl+Shift+O', click: () => win?.webContents.send('sniff-open') },
         { type: 'separator' },
         { label: '全部暂停', click: () => void engine.pauseAll() },
         { label: '全部继续', click: () => void engine.resumeAll() }
@@ -289,11 +288,13 @@ app.whenReady().then(async () => {
   buildMenu()
   createWindow()
   startPolling()
+  setSniffListener((hits, page) => win?.webContents.send('sniff-hits', hits, page))
   engine.onEvent = (method, gid, message) => {
     win?.webContents.send('engine-event', { method, gid, message })
     if (method === 'aria2.onDownloadComplete') {
       notify('下载完成', gid)
       void engine.maybeMerge(gid)
+      void engine.maybeAssembleHls(gid)
     }
     if (method === 'aria2.onBtDownloadComplete') notify('BT 下载完成，开始做种', gid)
     if (method === 'aria2.onDownloadError') notify('下载出错', gid)

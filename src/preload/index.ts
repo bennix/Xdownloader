@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { AddPayload, AriaApi, BrewProgress, EngineEvent, Settings, Snapshot, TaskDetail } from '../shared/types'
+import type { AddPayload, AriaApi, BrewProgress, EngineEvent, Settings, Snapshot, SniffHit, TaskDetail } from '../shared/types'
 
 const api: AriaApi = {
   snapshot: () => ipcRenderer.invoke('snapshot'),
@@ -8,7 +8,7 @@ const api: AriaApi = {
   addMetalink: (base64) => ipcRenderer.invoke('add-metalink', base64),
   pause: (gid) => ipcRenderer.invoke('pause', gid),
   resume: (gid) => ipcRenderer.invoke('resume', gid),
-  remove: (gid) => ipcRenderer.invoke('remove', gid),
+  remove: (gid, deleteFiles) => ipcRenderer.invoke('remove', gid, deleteFiles),
   pauseAll: () => ipcRenderer.invoke('pause-all'),
   resumeAll: () => ipcRenderer.invoke('resume-all'),
   move: (gid, how, pos) => ipcRenderer.invoke('move', gid, how, pos),
@@ -24,6 +24,21 @@ const api: AriaApi = {
   pickTorrent: () => ipcRenderer.invoke('pick-torrent'),
   pickMetalink: () => ipcRenderer.invoke('pick-metalink'),
   probeYouTube: (url, cookiesFromBrowser) => ipcRenderer.invoke('probe-youtube', url, cookiesFromBrowser),
+  sniffOpen: (url) => ipcRenderer.invoke('sniff-open', url),
+  sniffClose: () => ipcRenderer.invoke('sniff-close'),
+  sniffList: () => ipcRenderer.invoke('sniff-list'),
+  sniffRemove: (urls) => ipcRenderer.invoke('sniff-remove', urls),
+  importBrowserSession: (browserId, urls) => ipcRenderer.invoke('import-browser-session', browserId, urls),
+  onSniffHits: (cb) => {
+    const listener = (_event: Electron.IpcRendererEvent, hits: SniffHit[], pageUrl: string) => cb(hits, pageUrl)
+    ipcRenderer.on('sniff-hits', listener)
+    return () => ipcRenderer.removeListener('sniff-hits', listener)
+  },
+  onSniffOpen: (cb) => {
+    const listener = () => cb()
+    ipcRenderer.on('sniff-open', listener)
+    return () => ipcRenderer.removeListener('sniff-open', listener)
+  },
   listBrowsers: () => ipcRenderer.invoke('list-browsers'),
   saveSettings: (patch: Partial<Settings>) => ipcRenderer.invoke('save-settings', patch),
   brewStatus: () => ipcRenderer.invoke('brew-status'),

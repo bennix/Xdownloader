@@ -14,8 +14,9 @@ export function extractUrls(text: string): string[] {
 
 export function extractUrlsFromHtml(html: string): string[] {
   if (!html) return []
-  const hrefs = [...html.matchAll(/href=["']([^"']+)["']/gi)].map((m) => m[1])
-  return extractUrls(`${hrefs.join('\n')}\n${html}`)
+  const hrefs = [...html.matchAll(/(?:href|src)=["']([^"']+)["']/gi)].map((m) => m[1])
+  const m3u8 = [...html.matchAll(/["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/gi)].map((m) => m[1])
+  return extractUrls(`${hrefs.join('\n')}\n${m3u8.join('\n')}\n${html}`)
 }
 
 export function isDownloadUrl(value: string): boolean {
@@ -116,11 +117,35 @@ export function isXUrl(value: string): boolean {
   }
 }
 
-export function isMediaUrl(value: string): boolean {
-  return isYouTubeUrl(value) || isXUrl(value)
+export function isHlsUrl(value: string): boolean {
+  try {
+    const url = new URL(value)
+    const path = `${url.pathname}${url.search}`
+    return /\.m3u8(\?|#|$)/i.test(path) || /[?&](?:playlist|format)=m3u8\b/i.test(url.search)
+  } catch {
+    return /\.m3u8/i.test(value)
+  }
 }
 
-export function classifyUrl(value: string): 'magnet' | 'torrent' | 'metalink' | 'ftp' | 'youtube' | 'x' | 'http' {
+export function isMediaUrl(value: string): boolean {
+  return isYouTubeUrl(value) || isXUrl(value) || isHlsUrl(value)
+}
+
+export function sniffMediaKind(value: string, mime = ''): 'hls' | 'youtube' | 'x' | 'http' | '' {
+  const lower = value.toLowerCase()
+  const type = mime.toLowerCase()
+  if (/\.(js|css|woff2?|ttf|png|jpe?g|gif|svg|ico|map)(\?|#|$)/i.test(lower)) return ''
+  if (/(google-analytics|doubleclick|facebook\.com\/tr|hotjar|sentry)/i.test(lower)) return ''
+  if (/googlevideo\.com/i.test(lower)) return ''
+  if (isHlsUrl(value) || /mpegurl|x-mpegurl/i.test(type)) return 'hls'
+  if (isYouTubeUrl(value)) return 'youtube'
+  if (isXUrl(value)) return 'x'
+  if (/video\.twimg\.com/i.test(lower) && (/\.m3u8(\?|#|$)/i.test(lower) || /\.mp4(\?|#|$)/i.test(lower))) return 'x'
+  if (/^video\//i.test(type) || /\.(mp4|m4s|m4a|webm|mov)(\?|#|$)/i.test(lower)) return 'http'
+  return ''
+}
+
+export function classifyUrl(value: string): 'magnet' | 'torrent' | 'metalink' | 'ftp' | 'youtube' | 'x' | 'hls' | 'http' {
   const lower = value.toLowerCase()
   if (lower.startsWith('magnet:')) return 'magnet'
   if (/\.torrent(\?|#|$)/i.test(lower)) return 'torrent'
@@ -128,6 +153,7 @@ export function classifyUrl(value: string): 'magnet' | 'torrent' | 'metalink' | 
   if (lower.startsWith('ftp:') || lower.startsWith('sftp:')) return 'ftp'
   if (isYouTubeUrl(value) || /googlevideo\.com/i.test(lower)) return 'youtube'
   if (isXUrl(value) || /twimg\.com/i.test(lower)) return 'x'
+  if (isHlsUrl(value)) return 'hls'
   return 'http'
 }
 

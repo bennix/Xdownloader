@@ -1,9 +1,11 @@
 import { spawn } from 'node:child_process'
+import type { HlsProgress } from '../shared/types'
 import { existsSync, statSync } from 'node:fs'
-import { readdir, unlink } from 'node:fs/promises'
+import { readdir, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { bundledTool, resourceBinDir } from './binaries'
-import { isXUrl, isYouTubeUrl } from '../shared/urls'
+import { isHlsUrl, isXUrl, isYouTubeUrl } from '../shared/urls'
+import { probeHls } from './hls'
 
 export type YtQuality = string
 
@@ -33,6 +35,8 @@ export type ResolvedVideo = {
   progressive?: ResolvedStream
   video?: ResolvedStream
   audio?: ResolvedStream
+  hls?: ResolvedStream
+  hlsAudio?: ResolvedStream
 }
 
 type YtFormat = {
@@ -83,10 +87,21 @@ export async function resolveYouTube(
   binary: string,
   cookiesFromBrowser = ''
 ): Promise<ResolvedVideo[]> {
+  if (isHlsUrl(pageUrl)) {
+    return [
+      {
+        title: 'HLS',
+        pageUrl,
+        hls: { url: pageUrl, ext: 'm3u8', headers: [] }
+      }
+    ]
+  }
   const info = await loadYouTubeInfo(pageUrl, binary, cookiesFromBrowser)
   return flattenInfo(info)
     .map((item) => pickStreams(item, quality, pageUrl))
-    .filter((item): item is ResolvedVideo => Boolean(item?.progressive || item?.video || item?.audio))
+    .filter((item): item is ResolvedVideo =>
+      Boolean(item?.progressive || item?.video || item?.audio || item?.hls)
+    )
 }
 
 export async function probeYouTube(
@@ -94,6 +109,10 @@ export async function probeYouTube(
   binary: string,
   cookiesFromBrowser = ''
 ): Promise<YtProbe> {
+  if (isHlsUrl(pageUrl)) {
+    const probe = await probeHls(pageUrl)
+    return { url: pageUrl, title: probe.title, qualities: probe.qualities }
+  }
   const info = await loadYouTubeInfo(pageUrl, binary, cookiesFromBrowser, true)
   const first = flattenInfo(info)[0]
   return {
@@ -126,9 +145,7 @@ async function loadYouTubeInfo(
       const info = await fetchYouTubeInfo(pageUrl, binary, attempt, single)
       if (!hasPlayableInfo(info)) {
         throw new Error(
-          isXUrl(pageUrl)
-            ? '该 X 帖子没有可直接下载的视频（直播流或仅 HLS 暂不支持）'
-            : '没有解析到可下载格式'
+          isXUrl(pageUrl) ? '该 X 帖子没有可下载的视频（直播流暂不支持）' : '没有解析到可下载格式'
         )
       }
       infoCache.set(pageUrl, { at: Date.now(), info, cookies: attempt })
@@ -167,9 +184,9 @@ async function fetchYouTubeInfo(
 function hasPlayableInfo(info: YtInfo): boolean {
   return flattenInfo(info).some((item) =>
     Boolean(
-      (item.formats ?? []).some(usable) ||
-        (item.requested_formats ?? []).some(usable) ||
-        (item.url && !/m3u8|ism|mhtml/i.test(item.ext ?? ''))
+      (item.formats ?? []).some((format) => usable(format) || isHlsFormat(format)) ||
+        (item.requested_formats ?? []).some((format) => usable(format) || isHlsFormat(format)) ||
+        item.url
     )
   )
 }
@@ -206,7 +223,7 @@ function friendlyYtError(raw: string, pageUrl = ''): string {
 export function listQualities(info?: YtInfo): YtQualityOption[] {
   if (!info) return []
   const byHeight = new Map<number, YtFormat>()
-  for (const format of (info.formats ?? []).filter(usable).filter(hasVideo)) {
+  for (const format of (info.formats ?? []).filter((item) => usable(item) || isHlsFormat(item)).filter(hasVideo)) {
     const height = format.height ?? 0
     if (height < 144) continue
     const current = byHeight.get(height)
@@ -471,6 +488,25 @@ function pickStreams(info: YtInfo, quality: YtQuality, fallbackUrl: string): Res
       progressive: toStream(unlabeled, info)
     }
   }
+
+  const hlsFormats = (info.formats ?? []).filter(isHlsFormat)
+  const hlsVideo = bestAtOrBelow(hlsFormats.filter(hasVideo), cap)
+  const hlsAudio = hlsFormats.filter((item) => hasAudio(item) && !hasVideo(item)).sort(byAudio)[0]
+  if (hlsVideo && hlsAudio) {
+    return {
+      title: mediaFallbackTitle(info, fallbackUrl),
+      pageUrl: info.webpage_url || fallbackUrl,
+      hls: toStream(hlsVideo, info),
+      hlsAudio: toStream(hlsAudio, info)
+    }
+  }
+  if (hlsVideo || hlsAudio) {
+    return {
+      title: mediaFallbackTitle(info, fallbackUrl),
+      pageUrl: info.webpage_url || fallbackUrl,
+      hls: toStream(hlsVideo || hlsAudio, info)
+    }
+  }
   return null
 }
 
@@ -491,6 +527,12 @@ function usable(format: YtFormat): boolean {
   if (!format.url) return false
   const protocol = format.protocol ?? ''
   return !/m3u8|ism|mhtml|websocket|rtmp/i.test(protocol)
+}
+
+function isHlsFormat(format: YtFormat): boolean {
+  if (!format.url) return false
+  const protocol = format.protocol ?? ''
+  return /m3u8/i.test(protocol) || isHlsUrl(format.url)
 }
 
 function looksLikeProgressive(format: YtFormat): boolean {
@@ -558,7 +600,117 @@ function isPlaylistUrl(value: string): boolean {
   }
 }
 
-function firstExisting(list: (string | undefined)[]): string | null {
+export type ImpersonatedHlsOptions = {
+  url: string
+  dest: string
+  headers: string[]
+  quality: YtQuality
+  cookiesFromBrowser?: string
+  proxy?: string
+  onProgress?: (progress: HlsProgress) => void
+}
+
+// JSON conversions preserve unavailable values as null/"NA", never fake zero totals.
+export function parseHlsProgress(line: string): HlsProgress | null {
+  const at = line.indexOf('HLS_PROGRESS:')
+  if (at < 0) return null
+  try {
+    const p = JSON.parse(line.slice(at + 13))
+    const number = (value: unknown): number | null =>
+      (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) && Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : null
+    const downloadedBytes = number(p.downloaded_bytes) ?? 0
+    const totalBytes = number(p.total_bytes) || null
+    const totalBytesEstimate = number(p.total_bytes_estimate) || null
+    const fragmentIndex = number(p.fragment_index)
+    const fragmentCount = number(p.fragment_count) || null
+    const total = totalBytes ?? totalBytesEstimate
+    const percent = total ? downloadedBytes / total * 100 : fragmentCount && fragmentIndex !== null ? fragmentIndex / fragmentCount * 100 : null
+    const finished = p.status === 'finished'
+    return { downloadedBytes, totalBytes, totalBytesEstimate, fragmentIndex, fragmentCount,
+      percent: finished ? 100 : percent === null ? null : Math.min(100, percent),
+      speed: finished ? 0 : number(p.speed) ?? 0, eta: finished ? null : number(p.eta),
+      phase: finished ? '封装（Chrome）' : '下载（Chrome）' }
+  } catch { return null }
+}
+
+export function hlsProgressReader(emit: (progress: HlsProgress) => void) {
+  const pending = { stdout: '', stderr: '' }
+  return (chunk: string, stream: 'stdout' | 'stderr' = 'stdout', flush = false) => {
+    pending[stream] += chunk
+    const lines = pending[stream].split(/[\r\n]/)
+    pending[stream] = flush ? '' : lines.pop() || ''
+    for (const line of lines) { const progress = parseHlsProgress(line); if (progress) emit(progress) }
+  }
+}
+
+export async function downloadHlsImpersonated(binary: string, options: ImpersonatedHlsOptions): Promise<string> {
+  const cap = Number(options.quality)
+  const format =
+    options.quality === 'audio'
+      ? 'ba/b'
+      : Number.isFinite(cap) && cap > 0
+        ? `bv*[height<=${cap}]+ba/b[height<=${cap}]/bv*+ba/b`
+        : 'bv*+ba/b'
+  if (existsSync(options.dest)) throw new Error('HLS 暂存目标已存在，拒绝覆盖')
+  const base = ['--ignore-config', '--no-update', '--no-playlist', '--impersonate', 'chrome',
+    '--socket-timeout', '30', '--retries', '3', '--fragment-retries', '3',
+    '--abort-on-unavailable-fragments', '--hls-prefer-native', '--concurrent-fragments', '4',
+    '--no-overwrites', '-f', format]
+  const ffmpeg = findFfmpeg()
+  if (ffmpeg) base.push('--ffmpeg-location', ffmpeg)
+  // An empty proxy explicitly disables inherited proxy environment variables.
+  base.push('--proxy', options.proxy || '')
+  const headers = new Map<string, string>()
+  for (const line of options.headers) {
+    const at = line.indexOf(':')
+    if (at <= 0) continue
+    const key = line.slice(0, at).trim().toLowerCase()
+    if (/^(user-agent|sec-ch-.*|range|host|content-length|connection|accept-encoding)$/.test(key)) continue
+    headers.set(key, line.slice(at + 1).trim())
+  }
+  // Scope captured Cookie values to this resource host instead of forwarding a
+  // global Cookie header to unrelated segment/key hosts. yt-dlp owns redirects.
+  const cookie = headers.get('cookie')
+  headers.delete('cookie')
+  const cookieFile = `${options.dest}.cookies.txt`
+  if (cookie) {
+    const host = new URL(options.url).hostname
+    const rows = cookie.split(';').map(part => {
+      const at = part.indexOf('=')
+      return at > 0 ? [host, 'FALSE', '/', new URL(options.url).protocol === 'https:' ? 'TRUE' : 'FALSE', '0', part.slice(0, at).trim(), part.slice(at + 1).trim()].join('\t') : ''
+    }).filter(Boolean)
+    await writeFile(cookieFile, '# Netscape HTTP Cookie File\n' + rows.join('\n') + '\n', { mode: 0o600 })
+    base.push('--cookies', cookieFile)
+  } else {
+    const cookies = toCookiesBrowser(options.cookiesFromBrowser || '')
+    if (cookies && cookies !== 'none' && cookies !== 'auto') base.push('--cookies-from-browser', cookies)
+  }
+  for (const [key, value] of headers) base.push('--add-headers', `${key}: ${value}`)
+  try {
+    // Fail closed before any full media download. No fallback may bypass this gate.
+    const raw = await run(binary, [...base, '--skip-download', '--dump-single-json', options.url], 120000)
+    const info = JSON.parse(raw) as { is_live?: boolean | null; live_status?: string | null; duration?: number | null; has_drm?: boolean; requested_formats?: { has_drm?: boolean }[] }
+    if (info.is_live || ['is_live', 'is_upcoming', 'post_live'].includes(info.live_status || '')) throw new Error('直播 HLS 暂不下载')
+    // The generic m3u8 extractor reports no live flag for VOD; it only sums durations when #EXT-X-ENDLIST is present.
+    const vod = info.is_live === false || ['not_live', 'was_live'].includes(info.live_status || '') || Number(info.duration) > 0
+    if (!vod) throw new Error('直播或直播状态未知的 HLS 暂不下载')
+    if (info.has_drm || info.requested_formats?.some(item => item.has_drm)) throw new Error('不支持该 HLS 加密方式')
+    const reader = hlsProgressReader(progress => options.onProgress?.(progress))
+    const fields = ['status', 'downloaded_bytes', 'total_bytes', 'total_bytes_estimate', 'speed', 'eta', 'fragment_index', 'fragment_count']
+    const template = 'download:HLS_PROGRESS:{' + fields.map(key => `"${key}":%(progress.${key}|null)j`).join(',') + '}'
+    await run(binary, [...base, '--newline', '--progress', '--output-na-placeholder', 'null', '--progress-template',
+      template, '--merge-output-format', 'mp4',
+      '--remux-video', 'mp4', '-o', options.dest, options.url], 24 * 60 * 60 * 1000, reader)
+    reader('', 'stdout', true)
+    reader('', 'stderr', true)
+    if (!existsSync(options.dest) || !statSync(options.dest).size) throw new Error('yt-dlp 没有生成完整文件')
+    return options.dest
+  } finally {
+    if (cookie) await unlink(cookieFile).catch(() => undefined)
+  }
+}
+
+function firstExisting(list: (string | null | undefined)[]): string | null {
   const prefixes = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin']
   for (const item of list) {
     if (!item) continue
@@ -573,7 +725,7 @@ function firstExisting(list: (string | undefined)[]): string | null {
   return null
 }
 
-function run(binary: string, args: string[], timeoutMs: number): Promise<string> {
+function run(binary: string, args: string[], timeoutMs: number, onOutput?: (chunk: string, stream: 'stdout' | 'stderr') => void): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -589,10 +741,12 @@ function run(binary: string, args: string[], timeoutMs: number): Promise<string>
       reject(new Error('操作超时'))
     }, timeoutMs)
     child.stdout.on('data', (chunk) => {
-      out += String(chunk)
+      out = onOutput ? (out + String(chunk)).slice(-16000) : out + String(chunk)
+      onOutput?.(String(chunk), 'stdout')
     })
     child.stderr.on('data', (chunk) => {
-      err += String(chunk)
+      err = (err + String(chunk)).slice(-16000)
+      onOutput?.(String(chunk), 'stderr')
     })
     child.on('error', (error) => {
       clearTimeout(timer)
