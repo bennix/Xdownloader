@@ -3,8 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Xdownloader 1.0.4 — 把 aria2 做成一只会听的下载器</title>
-    <meta name="description" content="Xdownloader 1.0.4：macOS 上的 aria2 桌面客户端。YouTube / X / HLS 嗅探、Brave 过 Cloudflare、公证 DMG，内置 aria2 / yt-dlp / ffmpeg。" />
+    <title>Xdownloader 1.0.5 — 把 aria2 做成一只会听的下载器</title>
+    <meta name="description" content="Xdownloader 1.0.5：macOS 上的 aria2 桌面客户端。YouTube / X / HLS 时间分区、页面嗅探、Brave 过 Cloudflare、公证 DMG，内置 aria2 / yt-dlp / ffmpeg。" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,520;9..144,680&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -92,7 +92,7 @@
       <nav>
         <a href="#features">能力</a>
         <a href="#bundle">内置引擎</a>
-        <a href="#release">1.0.4</a>
+        <a href="#release">1.0.5</a>
         <a href="https://github.com/bennix/Xdownloader">GitHub</a>
       </nav>
     </header>
@@ -100,18 +100,18 @@
     <main>
       <section class="hero" style="border: 0; padding-top: 12vh;">
         <div>
-          <div class="kicker">v1.0.4 · macOS · Developer ID 公证</div>
+          <div class="kicker">v1.0.5 · macOS · Developer ID 公证</div>
           <h1>把整条下载管线握在一只手里。</h1>
-          <p class="lead">aria2 负责多连接分段，yt-dlp 负责 YouTube 与 X，内置页面可嗅探 HLS。Cloudflare 站点可借 Brave 当前页拉取。ffmpeg 负责把无声画面和音轨对齐合成。</p>
+          <p class="lead">aria2 负责多连接分段，yt-dlp 负责 YouTube 与 X，内置页面可嗅探 HLS。长视频可按时间分区下载并无损合并。Cloudflare 站点可借 Brave 当前页拉取。</p>
           <div class="cta">
-            <a class="btn primary" href="https://github.com/bennix/Xdownloader/releases/download/v1.0.4/Xdownloader-1.0.4-arm64.dmg">下载 1.0.4 DMG</a>
-            <a class="btn ghost" href="https://github.com/bennix/Xdownloader/releases/tag/v1.0.4">发布说明</a>
+            <a class="btn primary" href="https://github.com/bennix/Xdownloader/releases/download/v1.0.5/Xdownloader-1.0.5-arm64.dmg">下载 1.0.5 DMG</a>
+            <a class="btn ghost" href="https://github.com/bennix/Xdownloader/releases/tag/v1.0.5">发布说明</a>
           </div>
-          <p class="meta">Apple Silicon · 已公证 · 159 MB · 不经过 Homebrew 也能跑</p>
+          <p class="meta">Apple Silicon · 已公证 · 160 MB · 不经过 Homebrew 也能跑</p>
         </div>
         <div class="slab">
-          <b>1.0.4</b>
-          <span>嗅探页面、勾选入队、多窗口；Brave 过 TLS 握手被掐的站点。默认 16 路连接，进度按分块点亮。</span>
+          <b>1.0.5</b>
+          <span>HLS 时间分区默认 4 段、重叠 30 秒，自动无损合并并保留 .parts。嗅探入队、Brave 过握手被掐的站点。</span>
         </div>
       </section>
 
@@ -144,12 +144,12 @@
       </section>
 
       <section id="release">
-        <h2>1.0.4 这一版。</h2>
+        <h2>1.0.5 这一版。</h2>
         <div class="notes">
-          <div>内置页面嗅探，可同时打开多个窗口，勾选 HLS / 媒体地址加入下载队列。</div>
-          <div>遇到 Cloudflare 掐 Electron TLS（net_error -100）时，用 Brave 等本机浏览器当前播放页拉取。</div>
-          <div>公证 DMG：<a href="https://github.com/bennix/Xdownloader/releases/download/v1.0.4/Xdownloader-1.0.4-arm64.dmg">Xdownloader-1.0.4-arm64.dmg</a></div>
-          <div>sha256 <code>b26b8dd860082ffc43961072c12e6c479e40bd25927bd75496ab5b0a158ceec5</code></div>
+          <div>HLS 可按时间分区并行下载，验证重叠后无损合并成 MP4，并保留 .parts 目录以便失败重试。</div>
+          <div>内置页面嗅探，可同时打开多个窗口，勾选地址加入队列；Cloudflare 站点可借 Brave 当前播放页拉取。</div>
+          <div>公证 DMG：<a href="https://github.com/bennix/Xdownloader/releases/download/v1.0.5/Xdownloader-1.0.5-arm64.dmg">Xdownloader-1.0.5-arm64.dmg</a></div>
+          <div>sha256 <code>be64276159f1d67a495bf5257b6b49df261bef35b565ac04d341210b63576517</code></div>
         </div>
       </section>
     </main>
