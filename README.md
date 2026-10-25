@@ -24,4 +24,4 @@ export APPLE_TEAM_ID='5N66S29EK2'
 npm run dist
 ```
 
-产物在 `release/Xdownloader-1.0.4-arm64.dmg`。
+产物在 `release/Xdownloader-1.0.5-arm64.dmg`。最新公证包也保留在该目录。

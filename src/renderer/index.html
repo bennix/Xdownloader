@@ -70,7 +70,16 @@
             <label>Referer<input id="opt-referer" type="text" placeholder="会按链接自动填" /></label>
             <label>User-Agent<input id="opt-ua" type="text" placeholder="随所选浏览器自动填" /></label>
             <label>校验 checksum<input id="opt-checksum" type="text" placeholder="sha-256=…" /></label>
-            <label>连接数<input id="opt-split" type="number" min="1" max="16" placeholder="16" /></label>
+            <label>HLS 下载方式
+              <select id="opt-hls-mode">
+                <option value="settings">跟随设置</option>
+                <option value="single">不分段：完整 MP4</option>
+                <option value="temporal">分段：自动合并并保留分区</option>
+              </select>
+            </label>
+            <label title="分区下载后验证重叠并无损合并；保留 .parts 目录及 segments.json（使用内置 ffmpeg）">HLS 分段数<input id="opt-hls-parts" type="number" min="2" max="16" placeholder="跟随设置（默认 4）" /></label>
+            <label title="每个分区（最后一个除外）向后延伸的秒数，与下一分区重叠">HLS 相邻分区重叠秒数（仅向后延伸）<input id="opt-hls-overlap" type="number" min="0" max="600" placeholder="跟随设置（默认 30）" /></label>
+            <label>aria2 连接数<input id="opt-split" type="number" min="1" max="16" placeholder="16" /></label>
             <label>分片策略
               <select id="opt-piece">
                 <option value="">跟随全局</option>

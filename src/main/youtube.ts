@@ -608,6 +608,9 @@ export type ImpersonatedHlsOptions = {
   cookiesFromBrowser?: string
   proxy?: string
   onProgress?: (progress: HlsProgress) => void
+  sourceUrl?: string
+  fragmentConcurrency?: number
+  manifestOnly?: boolean
 }
 
 // JSON conversions preserve unavailable values as null/"NA", never fake zero totals.
@@ -653,8 +656,8 @@ export async function downloadHlsImpersonated(binary: string, options: Impersona
         : 'bv*+ba/b'
   if (existsSync(options.dest)) throw new Error('HLS 暂存目标已存在，拒绝覆盖')
   const base = ['--ignore-config', '--no-update', '--no-playlist', '--impersonate', 'chrome',
-    '--socket-timeout', '30', '--retries', '3', '--fragment-retries', '3',
-    '--abort-on-unavailable-fragments', '--hls-prefer-native', '--concurrent-fragments', '4',
+    '--socket-timeout', '30', '--retries', '3', '--fragment-retries', '3', '--retry-sleep', 'http:exp=1:8', '--retry-sleep', 'fragment:exp=1:8',
+    '--abort-on-unavailable-fragments', '--hls-prefer-native', '--concurrent-fragments', String(options.fragmentConcurrency ?? 4),
     '--no-overwrites', '-f', format]
   const ffmpeg = findFfmpeg()
   if (ffmpeg) base.push('--ffmpeg-location', ffmpeg)
@@ -674,10 +677,10 @@ export async function downloadHlsImpersonated(binary: string, options: Impersona
   headers.delete('cookie')
   const cookieFile = `${options.dest}.cookies.txt`
   if (cookie) {
-    const host = new URL(options.url).hostname
+    const host = new URL(options.sourceUrl || options.url).hostname
     const rows = cookie.split(';').map(part => {
       const at = part.indexOf('=')
-      return at > 0 ? [host, 'FALSE', '/', new URL(options.url).protocol === 'https:' ? 'TRUE' : 'FALSE', '0', part.slice(0, at).trim(), part.slice(at + 1).trim()].join('\t') : ''
+      return at > 0 ? [host, 'FALSE', '/', new URL(options.sourceUrl || options.url).protocol === 'https:' ? 'TRUE' : 'FALSE', '0', part.slice(0, at).trim(), part.slice(at + 1).trim()].join('\t') : ''
     }).filter(Boolean)
     await writeFile(cookieFile, '# Netscape HTTP Cookie File\n' + rows.join('\n') + '\n', { mode: 0o600 })
     base.push('--cookies', cookieFile)
@@ -687,6 +690,24 @@ export async function downloadHlsImpersonated(binary: string, options: Impersona
   }
   for (const [key, value] of headers) base.push('--add-headers', `${key}: ${value}`)
   try {
+    if (options.manifestOnly) {
+      // dump-single-json enables quiet mode and suppresses dump-pages. Normal
+      // verbosity produces base64 bodies preceded by their final request URL.
+      const dump = await run(binary, [...base, '--skip-download', '--dump-pages', '--no-quiet', options.url], 120000)
+      const lines = dump.split(/\r?\n/)
+      const bodies: { url: string; text: string }[] = []
+      for (let i = 0; i < lines.length - 1; i++) {
+        const match = lines[i].match(/Dumping request to (https?:\/\/\S+)/)
+        if (!match || !/^[A-Za-z0-9+/]+=*$/.test(lines[i + 1])) continue
+        const text = Buffer.from(lines[i + 1], 'base64').toString('utf8')
+        if (text.trimStart().startsWith('#EXTM3U')) bodies.push({ url: match[1], text })
+      }
+      // A master may select external audio: never silently partition video only.
+      if (bodies.some(b => /#EXT-X-(STREAM-INF|MEDIA):/.test(b.text))) throw new Error('主播放列表需单路模式以保证音视频对齐')
+      const media = bodies.filter(b => b.text.includes('#EXTINF:'))
+      if (!media.length) throw new Error('Chrome 未返回原始媒体播放列表')
+      return JSON.stringify(media[media.length - 1])
+    }
     // Fail closed before any full media download. No fallback may bypass this gate.
     const raw = await run(binary, [...base, '--skip-download', '--dump-single-json', options.url], 120000)
     const info = JSON.parse(raw) as { is_live?: boolean | null; live_status?: string | null; duration?: number | null; has_drm?: boolean; requested_formats?: { has_drm?: boolean }[] }

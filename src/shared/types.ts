@@ -40,6 +40,8 @@ export type Settings = {
   downloadDir: string
   aria2Path: string
   maxConcurrent: number
+  hlsPartitions: number
+  hlsOverlapSeconds: number
   split: number
   maxConnectionPerServer: number
   minSplitSize: string
@@ -108,6 +110,9 @@ export type Peer = {
 }
 
 export type HlsProgress = {
+  parts?: { index: number; percent: number; bytes: number; speed: number; phase: string }[]
+  overlapSeconds?: number
+  fallback?: string
   downloadedBytes: number
   totalBytes: number | null
   totalBytesEstimate: number | null
@@ -166,6 +171,9 @@ export type AddPayload = {
   userAgent?: string
   checksum?: string
   headers?: string[]
+  hlsMode?: 'settings' | 'single' | 'temporal'
+  hlsPartitions?: number
+  hlsOverlapSeconds?: number
   split?: number
   pieceSelector?: PieceSelector
   pause?: boolean

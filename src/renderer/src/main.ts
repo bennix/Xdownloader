@@ -209,6 +209,9 @@ function currentPayload(): AddPayload {
     checksum: $<HTMLInputElement>('opt-checksum').value.trim() || undefined,
     headers: header ? [header] : undefined,
     split: splitRaw ? Number(splitRaw) : undefined,
+    hlsMode: $<HTMLSelectElement>('opt-hls-mode').value as AddPayload['hlsMode'],
+    hlsPartitions: $<HTMLInputElement>('opt-hls-parts').value ? Number($<HTMLInputElement>('opt-hls-parts').value) : undefined,
+    hlsOverlapSeconds: $<HTMLInputElement>('opt-hls-overlap').value ? Number($<HTMLInputElement>('opt-hls-overlap').value) : undefined,
     pieceSelector: piece || undefined,
     pause: $<HTMLInputElement>('add-paused').checked,
     youtubeQuality: $<HTMLSelectElement>('yt-quality').value || 'best',
@@ -637,7 +640,7 @@ function renderGroup(group: TaskGroup): string {
 }
 
 function taskActions(status: string, managedHls = false): string {
-  if (managedHls) return '<button type="button" data-act="copy">复制链接</button><button type="button" data-act="folder">打开目录</button><span>HLS 串行队列 · 暂不支持暂停</span>'
+  if (managedHls) return '<button type="button" data-act="copy">复制链接</button><button type="button" data-act="folder">打开目录</button>' + (status === 'complete' || status === 'error' ? '<button type="button" data-act="remove">删除</button>' : '') + '<span>HLS 队列 · 分区最多4并行 · 暂不支持暂停</span>'
   const resume = status === 'paused' || status === 'waiting' ? `<button type="button" data-act="resume">继续</button>` : ''
   const pause = status === 'active' ? `<button type="button" data-act="pause">暂停</button>` : ''
   const done = status === 'complete' || status === 'error' || status === 'removed'
@@ -660,6 +663,9 @@ function groupMeta(group: TaskGroup): string {
       · ${formatBytes(completed)} / ${h.totalBytes ? formatBytes(h.totalBytes) : h.totalBytesEstimate ? '约 ' + formatBytes(h.totalBytesEstimate) : '未知大小'}
       · ${formatSpeed(speed)}${h.eta !== null ? ` · 当前流剩余 ${Math.ceil(h.eta)} 秒` : ''}
       ${h.fragmentIndex !== null ? ` · 当前流分片 ${h.fragmentIndex} / ${h.fragmentCount ?? '未知'}` : ''}
+      ${h.fallback ? `<br>${escapeHtml(h.fallback)}` : ''}
+      ${h.overlapSeconds !== undefined ? `<br>重叠传输 ${h.overlapSeconds.toFixed(1)} 秒（不计入核心进度）` : ''}
+      ${(h.parts || []).map(p => `<br>分区 ${p.index} · ${p.percent.toFixed(1)}% · ${formatBytes(p.bytes)} · ${formatSpeed(p.speed)} · ${escapeHtml(p.phase)}`).join('')}
       ${main.error ? ` · ${escapeHtml(main.error)}` : ''}`
   }
   return `${statusLabel(status, main.seeder, main.verifyPending)}
@@ -916,7 +922,9 @@ function renderSettings(): void {
     <div class="setting-grid">
       <label>保存目录<input id="set-dir" value="${escapeHtml(s.downloadDir)}" /></label>
       <label>同时任务<input id="set-concurrent" type="number" min="1" value="${s.maxConcurrent}" /></label>
-      <label>每任务连接数 split<input id="set-split" type="number" min="1" max="16" value="${s.split}" /></label>
+      <label title="1 = 单路；≥2 验证重叠后自动无损合并 MP4，并永久保留 .parts 目录。使用内置 ffmpeg；验证失败则保留分区并报错">HLS 时间分区（默认 4；合并 MP4 并保留分区）<input id="set-hls-parts" type="number" min="1" max="16" value="${s.hlsPartitions}" /></label>
+      <label title="每个分区（最后一个除外）向后延伸，与下一分区至少重叠该秒数（按分片边界取整）">HLS 相邻分区重叠秒数（默认 30，仅向后延伸）<input id="set-hls-overlap" type="number" min="0" max="600" value="${s.hlsOverlapSeconds}" /></label>
+      <label>aria2 每任务连接数 split<input id="set-split" type="number" min="1" max="16" value="${s.split}" /></label>
       <label>每服务器连接<input id="set-cps" type="number" min="1" max="16" value="${s.maxConnectionPerServer}" /></label>
       <label>最小分片<input id="set-minsplit" value="${escapeHtml(s.minSplitSize)}" /></label>
       <label>URI 选择
@@ -1328,6 +1336,8 @@ settingsEl.addEventListener('click', async (event) => {
     const next: Partial<Settings> = {
       downloadDir: (document.getElementById('set-dir') as HTMLInputElement).value,
       maxConcurrent: Number((document.getElementById('set-concurrent') as HTMLInputElement).value),
+      hlsPartitions: Number($<HTMLInputElement>('set-hls-parts').value),
+      hlsOverlapSeconds: Number($<HTMLInputElement>('set-hls-overlap').value),
       split: Number((document.getElementById('set-split') as HTMLInputElement).value),
       maxConnectionPerServer: Number((document.getElementById('set-cps') as HTMLInputElement).value),
       minSplitSize: (document.getElementById('set-minsplit') as HTMLInputElement).value,

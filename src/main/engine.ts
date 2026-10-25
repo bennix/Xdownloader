@@ -1,13 +1,15 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, statSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, readdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { existsSync, statSync, lstatSync, realpathSync, readdirSync } from 'node:fs'
+import { mkdir, mkdtemp, rm, rmdir, readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import type { AddPayload, ConnectionLane, Settings, Snapshot, Task, TaskDetail, TaskFile, TaskKind, YtQuality } from '../shared/types'
 import { classifyUrl, isDownloadUrl, isHlsUrl, isMediaUrl, isXUrl, isYouTubeUrl, mediaPageId, normalizeDownloadUrl, unique } from '../shared/urls'
 import { bundledTool, resourceBinDir } from './binaries'
 import { HlsQueue, publishHls, type HlsQueueItem } from './hls-queue'
+import { temporalOptions } from './hls-temporal'
+import { temporalPreflight, downloadTemporal, mergeTemporal } from './hls-temporal-download'
 import { AriaRpc, unwrapMulticall } from './rpc'
 import { getImportedUserAgent, importBrowserSession } from './browser-session'
 import { listBrowserOptions, resolveCookiesArg } from './browsers'
@@ -586,7 +588,14 @@ export class AriaEngine {
         return abs === base || abs.startsWith(base.endsWith(sep) ? base : `${base}${sep}`)
       })
       if (!allowed || !existsSync(abs)) continue
-      await unlink(abs).catch(() => undefined)
+      if (lstatSync(abs).isDirectory()) {
+        if (!/\.parts$/.test(abs) || realpathSync(abs) !== abs) continue
+        const names = await readdir(abs)
+        if (!names.includes('segments.json') || names.some(n => !/^(segments\.json|part-\d{2}\.mp4)$/.test(n) || !lstatSync(join(abs, n)).isFile())) continue
+        // Never recursively remove a directory containing unexpected user files.
+        for (const name of names) await unlink(join(abs, name))
+        await rmdir(abs).catch(() => undefined)
+      } else await unlink(abs).catch(() => undefined)
     }
   }
 
@@ -679,6 +688,7 @@ export class AriaEngine {
   }
 
   async saveSettings(patch: Partial<Settings>): Promise<Settings> {
+    temporalOptions(patch.hlsPartitions ?? this.settings.hlsPartitions, patch.hlsOverlapSeconds ?? this.settings.hlsOverlapSeconds)
     this.settings = { ...this.settings, ...patch }
     await mkdir(dirname(this.settingsFile), { recursive: true })
     await writeFile(this.settingsFile, JSON.stringify(this.settings, null, 2), 'utf8')
@@ -1021,7 +1031,7 @@ export class AriaEngine {
 
   private rememberMerged(outputPath: string, pageUrl: string, kind: TaskKind): void {
     if (!outputPath || !existsSync(outputPath)) return
-    const total = statSync(outputPath).size
+    const total = statSync(outputPath).isDirectory() ? readdirSync(outputPath).filter(n => /^part-\d{2}\.mp4$/.test(n)).reduce((n, name) => n + statSync(join(outputPath, name)).size, 0) : statSync(outputPath).size
     this.upsertHistory({
       gid: `done-${basename(outputPath)}-${total}`,
       kind,
@@ -1286,8 +1296,13 @@ export class AriaEngine {
     if (payload.pause) throw new Error('HLS 暂不支持暂停添加，请取消“暂停添加”')
     const binary = findYtDlp(this.settings.ytDlpPath)
     if (!binary) throw new Error('未找到 yt-dlp')
-    const accepted = this.managedHls.add(`${video.hls.url.split('#')[0]}|${video.hlsAudio?.url || ''}|${quality}`, {
-      video, payload, quality, binary, dir: this.settings.downloadDir, proxy: this.settings.allProxy,
+    const overlap = payload.hlsOverlapSeconds ?? this.settings.hlsOverlapSeconds
+    const requested = payload.hlsPartitions ?? this.settings.hlsPartitions
+    const parts = payload.hlsMode === 'single' ? 1
+      : payload.hlsMode === 'temporal' ? (requested > 1 ? requested : 4)
+        : requested
+    const accepted = this.managedHls.add(`${video.hls.url.split('#')[0]}|${video.hlsAudio?.url || ''}|${quality}|${parts}|${overlap}`, {
+      video, payload: { ...payload, hlsPartitions: temporalOptions(parts, overlap).parts, hlsOverlapSeconds: overlap }, quality, binary, dir: this.settings.downloadDir, proxy: this.settings.allProxy,
       browser: resolveCookiesArg(payload.ytCookiesFromBrowser || this.settings.ytCookiesFromBrowser) ?? ''
     })
     if (!accepted) return -1 // Existing task accepted; no new download was created.
@@ -1301,6 +1316,7 @@ export class AriaEngine {
     const staging = await mkdtemp(join(dir, '.hls-stage-'))
     const destination = join(dir, `${base}-${randomUUID().slice(0, 12)}.mp4`)
     const referer = payload.referer || (isHlsUrl(video.pageUrl) ? '' : video.pageUrl)
+    let fallback = ''
     let priorBytes = 0
     const separateTracks = Boolean(video.hlsAudio && quality !== 'audio')
     const download = async (stream: ResolvedStream, name: string, selected: string, offset: number, weight: number) => {
@@ -1314,7 +1330,7 @@ export class AriaEngine {
         onProgress: progress => {
           item.percent = offset + (progress.percent ?? 0) * weight
           item.phase = progress.phase
-          item.progress = { ...progress, downloadedBytes: priorBytes + progress.downloadedBytes,
+          item.progress = { ...progress, fallback, downloadedBytes: priorBytes + progress.downloadedBytes,
             // A first-track estimate is not the total size of both tracks.
             totalBytes: separateTracks ? null : progress.totalBytes,
             totalBytesEstimate: separateTracks ? null : progress.totalBytesEstimate }
@@ -1326,6 +1342,35 @@ export class AriaEngine {
     }
     try {
       item.phase = '验证播放列表（Chrome）'
+      if ((payload.hlsPartitions ?? 4) > 1) {
+        if (separateTracks || quality === 'audio') fallback = '单路回退：独立音视频时间对齐未经保证'
+        else if (proxy) fallback = '单路回退：代理模式暂不支持本地播放列表分区'
+        else {
+          const stream = video.hls!
+          const headers = [...(payload.headers || []), ...stream.headers]
+          if (referer) headers.push(`Referer: ${referer}`)
+          const options = { url: stream.url, dest: join(staging, 'probe.mp4'), headers, quality, cookiesFromBrowser: browser, proxy,
+            onProgress: (progress: import('../shared/types').HlsProgress) => { item.progress = progress; item.percent = progress.percent ?? 0; item.phase = progress.phase } }
+          let parts: Awaited<ReturnType<typeof temporalPreflight>> | undefined
+          try { parts = await temporalPreflight(binary, options, payload.hlsPartitions ?? 4, payload.hlsOverlapSeconds ?? 30) }
+          catch (error) { fallback = `单路回退：${error instanceof Error ? error.message : '播放列表不支持'}` }
+          if (parts && parts.length > 1) {
+            const folder = destination.replace(/\.mp4$/, '.parts')
+            await downloadTemporal(binary, options, parts, staging, folder)
+            item.path = folder // Expose retained files even if merging fails.
+            item.phase = '验证重叠并无损合并（保留全部分区）'
+            if (item.progress) item.progress = { ...item.progress, percent: 99, speed: 0, phase: item.phase }
+            await mergeTemporal(folder, destination)
+            item.path = destination
+            item.phase = `合并完成；分区保留于 ${folder}`
+            if (item.progress) item.progress = { ...item.progress, totalBytes: null, percent: 100, speed: 0, phase: item.phase }
+            this.rememberMerged(destination, video.pageUrl, 'hls')
+            this.onEvent?.('aria.onYoutubeMerged', destination)
+            return
+          }
+          if (parts) fallback = '单路回退：短视频无需时间分区'
+        }
+      }
       const output = join(staging, 'output.mp4')
       if (video.hlsAudio && quality !== 'audio') {
         const v = await download(video.hls!, 'video.mp4', quality, 0, 0.48)
@@ -1395,6 +1440,8 @@ export function defaultSettings(): Settings {
     downloadDir: join(homedir(), 'Downloads', 'XDownlder'),
     aria2Path: '',
     maxConcurrent: 5,
+    hlsPartitions: 4,
+    hlsOverlapSeconds: 30,
     split: 16,
     maxConnectionPerServer: 16,
     minSplitSize: '1M',
