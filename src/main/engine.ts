@@ -14,6 +14,7 @@ import { AriaRpc, unwrapMulticall } from './rpc'
 import { getImportedUserAgent, importBrowserSession } from './browser-session'
 import { listBrowserOptions, resolveCookiesArg } from './browsers'
 import {
+  BrokenTracksError,
   downloadHlsImpersonated,
   findUnmergedPairs,
   findYtDlp,
@@ -144,6 +145,8 @@ export class AriaEngine {
   private history: HistoryItem[] = []
   private dismissedPaths = new Set<string>()
   private readonly mergeFailAt = new Map<string, number>()
+  // Merges whose downloaded tracks are damaged; re-running them only re-decodes the same bad data.
+  private readonly brokenMerges = new Set<string>()
 
   constructor(private readonly userData: string) {
     this.settings = defaultSettings()
@@ -506,7 +509,7 @@ export class AriaEngine {
       const video = await this.pathOf(job.videoGid)
       const audio = await this.pathOf(job.audioGid)
       if (!video.path || !audio.path) throw new Error('音画文件还没就绪')
-      const dest = await mergeMedia(video.path, audio.path, job.outputPath)
+      const dest = await mergeMedia(video.path, audio.path, job.outputPath, job.sourceDuration)
       const pageUrl = this.youtubePages.get(job.videoGid) || this.youtubePages.get(job.audioGid) || ''
       await this.remove(job.videoGid, false).catch(() => undefined)
       await this.remove(job.audioGid, false).catch(() => undefined)
@@ -521,6 +524,7 @@ export class AriaEngine {
       job.merging = false
       const message = error instanceof Error ? error.message : String(error)
       this.error = message
+      if (error instanceof BrokenTracksError) this.brokenMerges.add(job.outputPath)
       this.emitMergeError(job.outputPath, message)
     }
   }
@@ -1145,6 +1149,7 @@ export class AriaEngine {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
           this.error = message
+          if (error instanceof BrokenTracksError) this.brokenMerges.add(pair.outputPath)
           this.emitMergeError(pair.outputPath, message)
         }
       }
@@ -1154,6 +1159,7 @@ export class AriaEngine {
   }
 
   private canRetryMerge(key: string): boolean {
+    if (this.brokenMerges.has(key)) return false
     const at = this.mergeFailAt.get(key) ?? 0
     return Date.now() - at > 20_000
   }
@@ -1274,6 +1280,7 @@ export class AriaEngine {
         videoGid,
         audioGid,
         outputPath: join(this.settings.downloadDir, `${base}.mp4`),
+        sourceDuration: video.duration,
         videoDone: false,
         audioDone: false,
         merging: false
@@ -1479,6 +1486,7 @@ type MergeJob = {
   videoGid: string
   audioGid: string
   outputPath: string
+  sourceDuration?: number
   videoDone: boolean
   audioDone: boolean
   merging: boolean

@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process'
 import type { HlsProgress } from '../shared/types'
 import { existsSync, statSync } from 'node:fs'
-import { readdir, unlink, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readdir, rename, unlink, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { dirname, join } from 'node:path'
 import { bundledTool, resourceBinDir } from './binaries'
 import { isHlsUrl, isXUrl, isYouTubeUrl } from '../shared/urls'
 import { probeHls } from './hls'
@@ -37,6 +38,7 @@ export type ResolvedVideo = {
   audio?: ResolvedStream
   hls?: ResolvedStream
   hlsAudio?: ResolvedStream
+  duration?: number
 }
 
 type YtFormat = {
@@ -50,6 +52,8 @@ type YtFormat = {
   tbr?: number
   abr?: number
   protocol?: string
+  format_note?: string
+  language?: string | null
   http_headers?: Record<string, string>
 }
 
@@ -57,6 +61,7 @@ type YtInfo = {
   _type?: string
   id?: string
   title?: string
+  duration?: number
   webpage_url?: string
   original_url?: string
   url?: string
@@ -249,67 +254,106 @@ export type UnmergedPair = {
   outputPath: string
 }
 
-export async function mergeMedia(videoPath: string, audioPath: string, outputPath: string): Promise<string> {
+// Corrupt or truncated tracks must never be published as a finished video: the
+// inputs are validated against the source duration and the output is fully
+// decoded before the separate tracks are removed.
+export async function mergeMedia(videoPath: string, audioPath: string, outputPath: string, sourceDuration = 0): Promise<string> {
   const ffmpeg = findFfmpeg()
   if (!ffmpeg) throw new Error('未找到 ffmpeg，无法合成音画')
   await waitFile(videoPath)
   await waitFile(audioPath)
   const dest = outputPath.replace(/\.[^.]+$/, '.mp4')
+  if (existsSync(dest)) throw new Error('目标文件已存在，不会覆盖')
   const videoInfo = await probeMedia(ffmpeg, videoPath).catch(() => emptyMedia())
   const audioInfo = await probeMedia(ffmpeg, audioPath).catch(() => emptyMedia())
-  const common = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-i', videoPath, '-i', audioPath]
-  const mux = ['-avoid_negative_ts', 'make_zero', '-max_interleave_delta', '0', '-movflags', '+faststart', '-shortest']
+  const keep = `视频和音频分轨已保留，可重新下载这两条轨道后再合成`
+  checkTrackDuration('视频', videoInfo.duration, sourceDuration, keep)
+  checkTrackDuration('音频', audioInfo.duration, sourceDuration, keep)
+  for (const [label, file] of [['视频', videoPath], ['音频', audioPath]] as const) {
+    const errors = await decodeErrors(ffmpeg, file)
+    if (errors) throw new BrokenTracksError(`${label}轨解码出错（${errors}），下载的数据已损坏。${keep}`)
+  }
+  const expect = sourceDuration > 0 ? sourceDuration : Math.min(videoInfo.duration || Infinity, audioInfo.duration || Infinity)
+  const tmp = join(dirname(dest), `.merge-${randomUUID()}.mp4`)
+  const common = ['-hide_banner', '-y', '-i', videoPath, '-i', audioPath]
+  const mux = ['-avoid_negative_ts', 'make_zero', '-max_interleave_delta', '0', '-movflags', '+faststart']
   const copyOk = isMp4Video(videoInfo.vcodec) && isAac(audioInfo.acodec)
   try {
     if (copyOk) {
-      await run(ffmpeg, [...common, '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy', ...mux, dest], 300000)
+      await run(ffmpeg, [...common, '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy', ...mux, tmp], 300000)
     } else {
-      throw new Error('需要重编码才能对齐时间轴')
-    }
-    if (await outputLooksCut(ffmpeg, dest, videoInfo.duration, audioInfo.duration)) {
-      throw new Error('copy 合成时长异常')
-    }
-  } catch {
-    try {
       await run(
         ffmpeg,
         [
           ...common,
           '-filter_complex',
           '[0:v]setpts=PTS-STARTPTS[v];[1:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a]',
-          '-map',
-          '[v]',
-          '-map',
-          '[a]',
-          '-c:v',
-          'libx264',
-          '-preset',
-          'veryfast',
-          '-crf',
-          '20',
-          '-pix_fmt',
-          'yuv420p',
-          '-c:a',
-          'aac',
-          '-b:a',
-          '192k',
-          '-ac',
-          '2',
-          ...mux,
-          dest
+          '-map', '[v]', '-map', '[a]',
+          '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+          '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
+          ...mux, tmp
         ],
         900000
       )
-    } catch (encodeError) {
-      const encodeMsg = encodeError instanceof Error ? encodeError.message : String(encodeError)
-      throw new Error(encodeMsg || 'ffmpeg 合成失败')
     }
+    await verifyMerged(ffmpeg, tmp, expect, keep)
+    await rename(tmp, dest)
+  } catch (error) {
+    await unlink(tmp).catch(() => undefined)
+    throw error instanceof Error ? error : new Error(String(error))
   }
   await unlink(videoPath).catch(() => undefined)
   await unlink(audioPath).catch(() => undefined)
   await unlink(`${videoPath}.aria2`).catch(() => undefined)
   await unlink(`${audioPath}.aria2`).catch(() => undefined)
   return dest
+}
+
+// Raised when the downloaded tracks themselves are unusable; retrying the merge cannot help.
+export class BrokenTracksError extends Error {}
+
+// A track more than 2 seconds (or 1%) shorter than the source was cut off in transfer.
+export function trackLooksShort(duration: number, sourceDuration: number): boolean {
+  if (!(sourceDuration > 0)) return false
+  return !(duration > 0) || duration + Math.max(2, sourceDuration * 0.01) < sourceDuration
+}
+
+function checkTrackDuration(label: string, duration: number, sourceDuration: number, keep: string): void {
+  if (!(duration > 0)) throw new BrokenTracksError(`${label}轨无法读取，文件可能已损坏。${keep}`)
+  if (trackLooksShort(duration, sourceDuration)) {
+    throw new BrokenTracksError(`${label}轨只有 ${formatSeconds(duration)}，原视频为 ${formatSeconds(sourceDuration)}，下载不完整。${keep}`)
+  }
+}
+
+async function verifyMerged(ffmpeg: string, file: string, expect: number, keep: string): Promise<void> {
+  const out = await probeMedia(ffmpeg, file).catch(() => emptyMedia())
+  if (!out.vcodec || !out.acodec) throw new Error(`合成结果缺少视频或音频流。${keep}`)
+  if (Number.isFinite(expect) && expect > 0 && trackLooksShort(out.duration, expect)) {
+    throw new Error(`合成结果只有 ${formatSeconds(out.duration)}，应为 ${formatSeconds(expect)}。${keep}`)
+  }
+  const errors = await decodeErrors(ffmpeg, file)
+  if (errors) throw new Error(`合成结果解码出错（${errors}），文件已损坏，未发布。${keep}`)
+}
+
+// Full decode to null; any decoder error means damaged packets that would play as
+// garbled audio or broken frames.
+async function decodeErrors(ffmpeg: string, file: string): Promise<string> {
+  const lines: string[] = []
+  try {
+    await run(ffmpeg, ['-hide_banner', '-nostats', '-v', 'error', '-i', file, '-map', '0', '-f', 'null', '-'], 1800000, (chunk, stream) => {
+      if (stream === 'stderr') for (const line of chunk.split('\n')) if (line.trim() && lines.length < 50) lines.push(line.trim())
+    })
+  } catch (error) {
+    if (!lines.length) lines.push(error instanceof Error ? error.message : String(error))
+  }
+  if (!lines.length) return ''
+  return `${lines.length >= 50 ? '50+' : lines.length} 处：${lines[0].slice(0, 120)}`
+}
+
+function formatSeconds(value: number): string {
+  const total = Math.max(0, Math.round(value))
+  const m = Math.floor(total / 60), sec = total % 60
+  return m ? `${m} 分 ${sec} 秒` : `${sec} 秒`
 }
 
 export async function findUnmergedPairs(dir: string): Promise<UnmergedPair[]> {
@@ -412,13 +456,6 @@ async function probeMedia(ffmpeg: string, file: string): Promise<MediaInfo> {
   }
 }
 
-async function outputLooksCut(ffmpeg: string, file: string, videoDuration: number, audioDuration: number): Promise<boolean> {
-  const expect = Math.min(videoDuration || Infinity, audioDuration || Infinity)
-  if (!Number.isFinite(expect) || expect <= 0) return false
-  const out = await probeMedia(ffmpeg, file).catch(() => emptyMedia())
-  return out.duration <= 0 || out.duration + 1.2 < expect
-}
-
 export function safeFilename(title: string): string {
   return (title || 'video').replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, 120)
 }
@@ -468,7 +505,8 @@ function pickStreams(info: YtInfo, quality: YtQuality, fallbackUrl: string): Res
       title: mediaFallbackTitle(info, fallbackUrl),
       pageUrl: info.webpage_url || fallbackUrl,
       video: toStream(video, info),
-      audio: toStream(audio, info)
+      audio: toStream(audio, info),
+      duration: Number(info.duration) > 0 ? Number(info.duration) : undefined
     }
   }
 
@@ -580,8 +618,13 @@ function byVideo(a: YtFormat, b: YtFormat): number {
   return (b.height ?? 0) - (a.height ?? 0) || videoRank(b) - videoRank(a) || (b.fps ?? 0) - (a.fps ?? 0) || (b.tbr ?? 0) - (a.tbr ?? 0)
 }
 
+// Dynamic-range-compressed variants (e.g. 140-drc) alter loudness; take them only when nothing else exists.
+function isDrc(format: YtFormat): boolean {
+  return /-drc$/i.test(format.format_id || '') || /\bDRC\b/i.test(format.format_note || '')
+}
+
 function byAudio(a: YtFormat, b: YtFormat): number {
-  return audioRank(b) - audioRank(a) || (b.abr ?? 0) - (a.abr ?? 0) || (b.tbr ?? 0) - (a.tbr ?? 0)
+  return Number(isDrc(a)) - Number(isDrc(b)) || audioRank(b) - audioRank(a) || (b.abr ?? 0) - (a.abr ?? 0) || (b.tbr ?? 0) - (a.tbr ?? 0)
 }
 
 function flattenInfo(info: YtInfo): YtInfo[] {
@@ -783,4 +826,8 @@ function run(binary: string, args: string[], timeoutMs: number, onOutput?: (chun
       reject(new Error(last || `${binary} 退出 ${code ?? 'null'}`))
     })
   })
+}
+
+export const __test = {
+  pickAudio: (formats: YtFormat[]) => formats.filter((item) => hasAudio(item) && !hasVideo(item)).sort(byAudio)[0]
 }
