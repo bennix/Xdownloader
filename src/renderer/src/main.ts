@@ -1,6 +1,6 @@
 declare global { interface Window { aria: import('../../shared/types').AriaApi } }
 import type { AddPayload, BrewProgress, BrowserOption, PieceSelector, Settings, Snapshot, SniffHit, Task, TaskDetail } from '../../shared/types'
-import { extractUrls, extractUrlsFromHtml, isHlsUrl, isMediaUrl, isXUrl, isYouTubeUrl, unique } from '../../shared/urls'
+import { extractUrls, extractUrlsFromHtml, isHlsUrl, isMediaUrl, isSniffSegmentUrl, isXUrl, isYouTubeUrl, sniffFamilyKey, unique } from '../../shared/urls'
 import { formatBytes, formatEta, formatSpeed, kindLabel, percent, statusLabel } from '../../shared/format'
 import { SubmissionQueue, sniffPayload, filterTasks, pendingSubmissionCount } from '../../shared/submissions'
 import './styles.css'
@@ -17,6 +17,17 @@ const banner = $<HTMLElement>('clip-banner')
 const sniffPanel = $<HTMLElement>('sniff-panel')
 const toast = $<HTMLElement>('toast')
 let sniffHits: SniffHit[] = []
+const sniffDismissed = new Set<string>()
+let sniffMuted = false
+
+function dismissHit(url: string): void {
+  sniffDismissed.add(url.split('#')[0])
+  sniffDismissed.add(sniffFamilyKey(url))
+}
+
+function isHitDismissed(url: string): boolean {
+  return sniffDismissed.has(url.split('#')[0]) || sniffDismissed.has(sniffFamilyKey(url))
+}
 const inspector = $<HTMLElement>('inspector')
 const settingsEl = $<HTMLElement>('settings')
 const dropzone = $<HTMLElement>('dropzone')
@@ -351,13 +362,24 @@ function groupedHits(): [string, { item: SniffHit; index: number }[]][] {
 }
 
 function renderSniffPanel(): void {
-  if (!sniffHits.length) {
+  if (!sniffHits.length && !sniffMuted) {
     sniffPanel.hidden = true
+    return
+  }
+  sniffPanel.hidden = false
+  if (!sniffHits.length) {
+    sniffPanel.innerHTML = `
+      <div>列表已清空，已暂停收录新地址</div>
+      <div class="row-actions">
+        <button data-sniff="resume">继续嗅探</button>
+        <button data-sniff="more">再开一页</button>
+        <button data-sniff="close">关闭全部页面</button>
+      </div>
+    `
     return
   }
   const picked = selectedHits().length
   const groups = groupedHits()
-  sniffPanel.hidden = false
   sniffPanel.innerHTML = `
     <div>嗅探到 ${sniffHits.length} 条，已选 ${picked} 条 · ${groups.length} 个页面</div>
     <div class="sniff-hits">
@@ -384,6 +406,7 @@ function renderSniffPanel(): void {
       <button data-sniff="add" class="primary">下载选中</button>
       <button data-sniff="remove">删除选中</button>
       <button data-sniff="remove-added">删除已加入</button>
+      <button data-sniff="clear">清空列表</button>
       <button data-sniff="close">关闭全部页面</button>
     </div>
   `
@@ -420,6 +443,8 @@ async function importFromBrowser(): Promise<void> {
 }
 
 async function openSniffer(): Promise<void> {
+  sniffMuted = false
+  void window.aria.sniffResume()
   const urls = extractUrls(input.value)
   const targets = urls.length ? urls : [input.value.trim()]
   let opened = 0
@@ -434,7 +459,7 @@ async function openSniffer(): Promise<void> {
   }
   const listed = await window.aria.sniffList()
   const selected = new Map(sniffHits.map((item) => [item.url.split('#')[0], item.selected]))
-  sniffHits = uniqueHits(listed).map((item) => ({
+  sniffHits = uniqueHits(listed.filter((item) => !isHitDismissed(item.url) && !isSniffSegmentUrl(item.url))).map((item) => ({
     ...item,
     selected: selected.get(item.url.split('#')[0]) ?? item.selected
   }))
@@ -458,10 +483,32 @@ sniffPanel.addEventListener('change', (event) => {
 function removeHits(targets: SniffHit[]): void {
   if (!targets.length) return
   const keys = new Set(targets.map((item) => item.url.split('#')[0]))
-  sniffHits = sniffHits.filter((item) => !keys.has(item.url.split('#')[0]))
+  for (const item of targets) dismissHit(item.url)
+  sniffHits = sniffHits.filter((item) => !isHitDismissed(item.url))
+  if (!sniffHits.length) sniffMuted = true
   void window.aria.sniffRemove([...keys])
+  if (!sniffHits.length) void window.aria.sniffClear()
   renderSniffPanel()
   showToast(`已删除 ${keys.size} 条`)
+}
+
+async function clearSniffList(): Promise<void> {
+  const count = sniffHits.length
+  for (const item of sniffHits) dismissHit(item.url)
+  sniffHits = []
+  sniffMuted = true
+  await window.aria.sniffClear()
+  renderSniffPanel()
+  showToast(count ? `已清空 ${count} 条` : '列表已经是空的')
+}
+
+async function resumeSniffList(): Promise<void> {
+  sniffMuted = false
+  await window.aria.sniffResume()
+  const listed = await window.aria.sniffList()
+  sniffHits = uniqueHits(listed.filter((item) => !isHitDismissed(item.url) && !isSniffSegmentUrl(item.url)))
+  renderSniffPanel()
+  showToast(sniffHits.length ? `继续嗅探，当前 ${sniffHits.length} 条` : '已继续嗅探，播放后会出现新地址')
 }
 
 sniffPanel.addEventListener('click', (event) => {
@@ -495,6 +542,14 @@ sniffPanel.addEventListener('click', (event) => {
     else removeHits(added)
     return
   }
+  if (button.dataset.sniff === 'clear') {
+    void clearSniffList()
+    return
+  }
+  if (button.dataset.sniff === 'resume') {
+    void resumeSniffList()
+    return
+  }
   const picked = selectedHits()
   const urls = picked.map((item) => item.url)
   if (!urls.length && button.dataset.sniff !== 'close') {
@@ -525,6 +580,8 @@ sniffPanel.addEventListener('click', (event) => {
   if (button.dataset.sniff === 'close') {
     void window.aria.sniffClose()
     sniffHits = []
+    sniffDismissed.clear()
+    sniffMuted = false
     sniffPanel.hidden = true
   }
 })
@@ -666,6 +723,9 @@ function groupMeta(group: TaskGroup): string {
       ${h.fallback ? `<br>${escapeHtml(h.fallback)}` : ''}
       ${h.overlapSeconds !== undefined ? `<br>重叠传输 ${h.overlapSeconds.toFixed(1)} 秒（不计入核心进度）` : ''}
       ${(h.parts || []).map(p => `<br>分区 ${p.index} · ${p.percent.toFixed(1)}% · ${formatBytes(p.bytes)} · ${formatSpeed(p.speed)} · ${escapeHtml(p.phase)}`).join('')}
+      ${h.mergedPath ? `<br>已无损合并 ${escapeHtml(h.mergedPath.split('/').pop() || h.mergedPath)}` : ''}
+      ${h.partsDir && !h.mergedPath ? `<br>分区已齐，正在合并` : ''}
+      ${h.partsDir ? `<br>分区目录 ${escapeHtml(h.partsDir.split('/').pop() || h.partsDir)}` : ''}
       ${main.error ? ` · ${escapeHtml(main.error)}` : ''}`
   }
   return `${statusLabel(status, main.seeder, main.verifyPending)}
@@ -1053,7 +1113,11 @@ if (window.aria) {
     banner.innerHTML = `剪贴板里有 ${urls.length} 条链接 <button id="clip-yes">添加并按多源下载</button> <button id="clip-copy">复制这些链接</button> <button id="clip-no">忽略</button>`
   })
   window.aria.onSniffHits((hits) => {
-    sniffHits = uniqueHits([...sniffHits, ...hits])
+    if (sniffMuted) return
+    sniffHits = uniqueHits([
+      ...sniffHits,
+      ...hits.filter((item) => !isHitDismissed(item.url) && !isSniffSegmentUrl(item.url))
+    ])
     renderSniffPanel()
   })
   window.aria.onSniffOpen(() => void openSniffer())

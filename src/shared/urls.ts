@@ -131,12 +131,43 @@ export function isMediaUrl(value: string): boolean {
   return isYouTubeUrl(value) || isXUrl(value) || isHlsUrl(value)
 }
 
+export function isSniffSegmentUrl(value: string): boolean {
+  if (isHlsUrl(value)) return false
+  try {
+    const path = new URL(value).pathname
+    if (/\.(m4s|ts)(\?|#|$)/i.test(path)) return true
+    if (/\/(?:b-hls-\d+|hls|dash|chunk|fragments?|segments?)(\/|$)/i.test(path)) return true
+    if (/_\d+p_h\d+_\d+_/i.test(path)) return true
+    if (/(?:^|\/)(?:init|seg(?:ment)?[-_]?\d+)\.(?:mp4|m4s|ts)$/i.test(path)) return true
+    return false
+  } catch {
+    return /\.(m4s|ts)(\?|#|$)/i.test(value)
+  }
+}
+
+export function sniffFamilyKey(value: string): string {
+  const bare = value.split('#')[0]
+  try {
+    const url = new URL(bare)
+    if (isHlsUrl(bare) || isYouTubeUrl(bare) || isXUrl(bare)) return bare
+    const path = url.pathname
+    if (!isSniffSegmentUrl(bare)) return `${url.origin}${path}`
+    const parts = path.split('/')
+    const file = parts.pop() || ''
+    const stem = file.replace(/_\d+(?=_|\.)/g, '_*').replace(/\d{8,}/g, '*')
+    return `${url.origin}${parts.join('/')}/${stem}`
+  } catch {
+    return bare
+  }
+}
+
 export function sniffMediaKind(value: string, mime = ''): 'hls' | 'youtube' | 'x' | 'http' | '' {
   const lower = value.toLowerCase()
   const type = mime.toLowerCase()
   if (/\.(js|css|woff2?|ttf|png|jpe?g|gif|svg|ico|map)(\?|#|$)/i.test(lower)) return ''
   if (/(google-analytics|doubleclick|facebook\.com\/tr|hotjar|sentry)/i.test(lower)) return ''
   if (/googlevideo\.com/i.test(lower)) return ''
+  if (isSniffSegmentUrl(value)) return ''
   if (isHlsUrl(value) || /mpegurl|x-mpegurl/i.test(type)) return 'hls'
   if (isYouTubeUrl(value)) return 'youtube'
   if (isXUrl(value)) return 'x'

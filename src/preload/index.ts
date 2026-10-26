@@ -28,6 +28,8 @@ const api: AriaApi = {
   sniffClose: () => ipcRenderer.invoke('sniff-close'),
   sniffList: () => ipcRenderer.invoke('sniff-list'),
   sniffRemove: (urls) => ipcRenderer.invoke('sniff-remove', urls),
+  sniffClear: () => ipcRenderer.invoke('sniff-clear'),
+  sniffResume: () => ipcRenderer.invoke('sniff-resume'),
   importBrowserSession: (browserId, urls) => ipcRenderer.invoke('import-browser-session', browserId, urls),
   onSniffHits: (cb) => {
     const listener = (_event: Electron.IpcRendererEvent, hits: SniffHit[], pageUrl: string) => cb(hits, pageUrl)

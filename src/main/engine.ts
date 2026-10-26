@@ -126,16 +126,22 @@ export class AriaEngine {
   private readonly hlsJobs: HlsJob[] = []
   private readonly managedHls = new HlsQueue<{ video: ResolvedVideo; payload: AddPayload; quality: string; dir: string; proxy: string; binary: string; browser: string }>(item => this.runManagedHls(item))
   private managedHlsTasks(): Task[] {
-    return this.managedHls.items.map(item => ({ ...mapTask({ gid: item.id, status: item.status }, []),
+    return this.managedHls.items.map(item => {
+      const mergedPath = item.progress?.mergedPath || (item.path.endsWith('.mp4') ? item.path : '')
+      const inferredParts = item.progress?.partsDir || (item.path.endsWith('.parts') ? item.path : item.path.replace(/\.mp4$/, '.parts'))
+      const partsDir = inferredParts && existsSync(inferredParts) ? inferredParts : ''
+      const phase = item.phase === '完成' && mergedPath && partsDir ? `合并完成；分区保留于 ${partsDir}` : item.phase
+      return { ...mapTask({ gid: item.id, status: item.status }, []),
       kind: 'hls', name: item.input.video.title,
       dir: item.input.dir, path: item.path, total: item.progress?.totalBytes ?? item.progress?.totalBytesEstimate ?? 0,
       completed: item.progress?.downloadedBytes ?? 0,
       speed: item.status === 'active' ? item.progress?.speed ?? 0 : 0,
       hls: { downloadedBytes: 0, totalBytes: null, totalBytesEstimate: null, speed: 0, eta: null,
-        fragmentIndex: null, fragmentCount: null, ...item.progress,
+        fragmentIndex: null, fragmentCount: null, ...item.progress, mergedPath, partsDir,
         percent: item.status === 'complete' ? 100 : item.progress?.percent === null || !item.progress ? null : item.percent,
-        phase: item.phase, ...(item.status !== 'active' ? { speed: 0, eta: null } : {}) },
-      error: item.error, pageUrl: item.input.video.pageUrl, urls: [item.input.video.hls!.url] }))
+        phase, ...(item.status !== 'active' ? { speed: 0, eta: null } : {}) },
+      error: item.error, pageUrl: item.input.video.pageUrl, urls: [item.input.video.hls!.url] }
+    })
   }
   private resolvingTasks(): Task[] {
     return [...this.addingPages].map(url => ({ ...mapTask({ gid: `resolve-${url}`, status: 'active' }, []),
@@ -1365,12 +1371,25 @@ export class AriaEngine {
             const folder = destination.replace(/\.mp4$/, '.parts')
             await downloadTemporal(binary, options, parts, staging, folder)
             item.path = folder // Expose retained files even if merging fails.
-            item.phase = '验证重叠并无损合并（保留全部分区）'
-            if (item.progress) item.progress = { ...item.progress, percent: 99, speed: 0, phase: item.phase }
-            await mergeTemporal(folder, destination)
+            const reportMerge = (message: string) => {
+              item.phase = message
+              if (item.progress) item.progress = { ...item.progress, percent: 99, speed: 0, phase: message, partsDir: folder }
+            }
+            reportMerge('验证重叠并无损合并（保留全部分区）')
+            await mergeTemporal(folder, destination, reportMerge)
             item.path = destination
             item.phase = `合并完成；分区保留于 ${folder}`
-            if (item.progress) item.progress = { ...item.progress, totalBytes: null, percent: 100, speed: 0, phase: item.phase }
+            if (item.progress) {
+              item.progress = {
+                ...item.progress,
+                totalBytes: null,
+                percent: 100,
+                speed: 0,
+                phase: item.phase,
+                mergedPath: destination,
+                partsDir: folder
+              }
+            }
             this.rememberMerged(destination, video.pageUrl, 'hls')
             this.onEvent?.('aria.onYoutubeMerged', destination)
             return

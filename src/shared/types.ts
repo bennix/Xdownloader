@@ -113,6 +113,8 @@ export type HlsProgress = {
   parts?: { index: number; percent: number; bytes: number; speed: number; phase: string }[]
   overlapSeconds?: number
   fallback?: string
+  mergedPath?: string
+  partsDir?: string
   downloadedBytes: number
   totalBytes: number | null
   totalBytesEstimate: number | null
@@ -251,6 +253,8 @@ export type AriaApi = {
   sniffClose: () => Promise<void>
   sniffList: () => Promise<SniffHit[]>
   sniffRemove: (urls: string[]) => Promise<number>
+  sniffClear: () => Promise<number>
+  sniffResume: () => Promise<void>
   importBrowserSession: (browserId: string, urls?: string[]) => Promise<BrowserSessionImport>
   onSniffHits: (cb: (hits: SniffHit[], pageUrl: string) => void) => () => void
   onSniffOpen: (cb: () => void) => () => void

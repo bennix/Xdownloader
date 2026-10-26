@@ -22,7 +22,12 @@ export class HlsQueue<T> {
       for (const item of this.items) {
         if (item.status !== 'waiting') continue
         item.status = 'active'
-        try { await this.run(item); item.status = 'complete'; item.percent = 100; item.phase = '完成' }
+        try {
+          await this.run(item)
+          item.status = 'complete'
+          item.percent = 100
+          if (!item.phase || item.phase === '排队' || item.phase === '发布文件') item.phase = '完成'
+        }
         catch (error) { item.status = 'error'; item.error = error instanceof Error ? error.message : String(error); item.phase = '失败' }
         finally { if (item.progress) { item.progress.speed = 0; item.progress.eta = null } }
       }

@@ -352,6 +352,7 @@ input:-webkit-autofill:focus {
 .toast { border-style: solid; border-color: var(--line); }
 
 .sniff-panel { display: grid; gap: 8px; }
+.sniff-panel[hidden] { display: none !important; }
 .sniff-panel .sniff-hits { display: grid; gap: 4px; max-height: 220px; overflow: auto; }
 .sniff-panel .sniff-page { margin-top: 6px; color: var(--text); font-size: 12px; font-weight: 600; }
 .sniff-panel .sniff-page:first-child { margin-top: 0; }

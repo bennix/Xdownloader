@@ -21,7 +21,7 @@ import { brewSnapshot, installMissing, onBrewProgress } from './brew'
 import { listBrowserOptions } from './browsers'
 import { AriaEngine } from './engine'
 import { importBrowserSession } from './browser-session'
-import { closeSniffer, openSniffer, removeSniffHits, setSniffListener, sniffHits } from './sniffer'
+import { clearSniffHits, closeSniffer, openSniffer, removeSniffHits, resumeSniffHits, setSniffListener, sniffHits } from './sniffer'
 import { findYtDlp } from './youtube'
 
 app.commandLine.appendSwitch('disable-quic')
@@ -181,6 +181,8 @@ function bindIpc(): void {
   ipcMain.handle('sniff-close', () => closeSniffer())
   ipcMain.handle('sniff-list', () => sniffHits())
   ipcMain.handle('sniff-remove', (_event, urls: string[]) => removeSniffHits(Array.isArray(urls) ? urls : []))
+  ipcMain.handle('sniff-clear', () => clearSniffHits())
+  ipcMain.handle('sniff-resume', () => resumeSniffHits())
   ipcMain.handle('import-browser-session', (_event, browserId: string, urls: string[] = []) =>
     importBrowserSession(browserId || engine.currentSettings.ytCookiesFromBrowser, urls, findYtDlp(engine.currentSettings.ytDlpPath) ?? '')
   )

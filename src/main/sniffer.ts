@@ -1,5 +1,5 @@
 import { BrowserWindow, session, webContents } from 'electron'
-import { extractUrls, extractUrlsFromHtml, sniffMediaKind, unique } from '../shared/urls'
+import { extractUrls, extractUrlsFromHtml, sniffFamilyKey, sniffMediaKind, unique } from '../shared/urls'
 import type { SniffHit } from '../shared/types'
 
 type Listener = (hits: SniffHit[], pageUrl: string) => void
@@ -9,6 +9,17 @@ const sniffWins = new Set<BrowserWindow>()
 const seen = new Set<string>()
 const collected: SniffHit[] = []
 const dismissed = new Set<string>()
+const dismissedFamilies = new Set<string>()
+let accepting = true
+
+function bareUrl(url: string): string {
+  return url.split('#')[0]
+}
+
+function isDismissed(url: string): boolean {
+  const bare = bareUrl(url)
+  return dismissed.has(bare) || dismissedFamilies.has(sniffFamilyKey(bare))
+}
 
 export function setSniffListener(listener: Listener | null): void {
   onHits = listener
@@ -19,13 +30,36 @@ export function sniffHits(): SniffHit[] {
 }
 
 export function removeSniffHits(urls: string[]): number {
-  const keys = new Set(urls.map((url) => url.split('#')[0]))
+  const keys = new Set(urls.map((url) => bareUrl(url)))
+  const families = new Set([...keys].map((url) => sniffFamilyKey(url)))
   for (const key of keys) dismissed.add(key)
+  for (const family of families) dismissedFamilies.add(family)
+  for (const item of [...seen]) {
+    const url = item.slice(item.indexOf('|') + 1)
+    if (keys.has(url) || families.has(sniffFamilyKey(url))) seen.delete(item)
+  }
   const before = collected.length
   for (let i = collected.length - 1; i >= 0; i -= 1) {
-    if (keys.has(collected[i].url.split('#')[0])) collected.splice(i, 1)
+    const url = bareUrl(collected[i].url)
+    if (keys.has(url) || families.has(sniffFamilyKey(url))) collected.splice(i, 1)
   }
   return before - collected.length
+}
+
+export function clearSniffHits(): number {
+  const count = collected.length
+  for (const item of collected) {
+    dismissed.add(bareUrl(item.url))
+    dismissedFamilies.add(sniffFamilyKey(item.url))
+  }
+  collected.length = 0
+  seen.clear()
+  accepting = false
+  return count
+}
+
+export function resumeSniffHits(): void {
+  accepting = true
 }
 
 export function isSnifferOpen(): boolean {
@@ -66,7 +100,9 @@ export async function openSniffer(url: string, parent?: BrowserWindow | null): P
     seen.clear()
     collected.length = 0
     dismissed.clear()
+    dismissedFamilies.clear()
   }
+  accepting = true
   const existing = [...sniffWins].find((win) => samePage(win.webContents.getURL(), target))
   if (existing) {
     existing.show()
@@ -204,14 +240,11 @@ async function scrapePage(contents: Electron.WebContents): Promise<void> {
 function addHits(items: SniffHit[]): void {
   const fresh: SniffHit[] = []
   for (const item of items) {
-    if (dismissed.has(item.url.split('#')[0])) continue
+    if (!accepting || isDismissed(item.url)) continue
     const key = `${item.pageUrl || ''}|${item.url.split('#')[0]}`
     if (seen.has(key)) {
       const existing = collected.find((hit) => `${hit.pageUrl || ''}|${hit.url.split('#')[0]}` === key)
-      if (existing && item.source === 'network' && item.headers?.length) {
-        existing.headers = [...item.headers]
-        fresh.push(existing)
-      }
+      if (existing && item.source === 'network' && item.headers?.length) existing.headers = [...item.headers]
       continue
     }
     seen.add(key)
